@@ -1,0 +1,69 @@
+# Periodically rebase the agent-harbor branch onto upstream nixos-25.05.
+#
+# Runs weekly and can be triggered manually. If the rebase fails (conflict),
+# it opens an issue so a human can resolve it.
+
+name: Sync upstream nixpkgs
+
+on:
+  schedule:
+    - cron: '0 6 * * 1' # Every Monday at 06:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  sync:
+    name: Rebase onto upstream nixos-25.05
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: agent-harbor
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Add upstream remote
+        run: |
+          git remote add upstream https://github.com/NixOS/nixpkgs.git || true
+          git fetch upstream nixos-25.05
+
+      - name: Rebase onto upstream
+        id: rebase
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if git rebase upstream/nixos-25.05; then
+            echo "status=success" >> "$GITHUB_OUTPUT"
+          else
+            git rebase --abort
+            echo "status=conflict" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Push rebased branch
+        if: steps.rebase.outputs.status == 'success'
+        run: git push --force-with-lease origin agent-harbor
+
+      - name: Open issue on conflict
+        if: steps.rebase.outputs.status == 'conflict'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const existing = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'upstream-sync',
+            });
+            if (existing.data.length === 0) {
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: 'Upstream sync conflict: agent-harbor branch needs manual rebase',
+                body: 'The automated rebase of `agent-harbor` onto `upstream/nixos-25.05` failed due to conflicts.\n\nTo resolve:\n```bash\ngit fetch upstream nixos-25.05\ngit rebase upstream/nixos-25.05\n# fix conflicts\ngit push --force-with-lease origin agent-harbor\n```',
+                labels: ['upstream-sync'],
+              });
+            }
