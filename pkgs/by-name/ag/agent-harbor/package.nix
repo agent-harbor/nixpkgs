@@ -2,6 +2,7 @@
   lib,
   stdenv,
   fetchurl,
+  nix,
 }:
 
 let
@@ -24,9 +25,7 @@ stdenv.mkDerivation {
   pname = "agent-harbor";
   inherit version;
 
-  src = fetchurl (
-    sources.${system} or (throw "agent-harbor: unsupported platform ${system}")
-  );
+  src = fetchurl (sources.${system} or (throw "agent-harbor: unsupported platform ${system}"));
 
   # Musl-static binaries — nothing to patch or strip
   dontStrip = true;
@@ -37,18 +36,51 @@ stdenv.mkDerivation {
     {
       x86_64-linux = "x86_64-linux";
       aarch64-linux = "aarch64-linux";
-    }.${system}
+    }
+    .${system}
   }";
 
   installPhase = ''
     runHook preInstall
 
-    mkdir -p $out/bin
-    for bin in ah ah-fs-snapshots-daemon agentfs-fuse; do
+    mkdir -p $out/bin $out/libexec/agent-harbor
+
+    if [ -f "bin/ah" ]; then
+      install -m 0755 "bin/ah" "$out/libexec/agent-harbor/ah"
+    fi
+
+    for bin in ah-fs-snapshots-daemon agentfs-fuse; do
       if [ -f "bin/$bin" ]; then
         install -m 0755 "bin/$bin" "$out/bin/$bin"
       fi
     done
+
+    cat > "$out/bin/ah" <<EOF
+    #!${stdenv.shell}
+    set -u
+
+    export AH_RUNTIME_ROOT="\''${AH_RUNTIME_ROOT:-$out}"
+    export AH_RUNTIME_ROOT_CHANNEL="\''${AH_RUNTIME_ROOT_CHANNEL:-nix}"
+    export AH_BIN="\''${AH_BIN:-$out/bin/ah}"
+    export AH_NIX_STORE_BIN="\''${AH_NIX_STORE_BIN:-${nix}/bin/nix-store}"
+
+    if [ "\''${AH_ACTIVATION_STORE:-}" != "" ] && [ "\''${AH_RUNTIME_GC_ROOT:-}" = "" ] && [ "\''${1:-}" = "agent" ] && [ "\''${2:-}" = "record" ]; then
+      gc_roots_dir="\''${AH_NIX_GC_ROOTS_DIR:-\''${XDG_STATE_HOME:-\''${HOME:-/tmp}/.local/state}/agent-harbor/nix-gcroots}"
+      if mkdir -p "\$gc_roots_dir"; then
+        runtime_name="\$(basename "\$AH_RUNTIME_ROOT")"
+        candidate_gc_root="\$gc_roots_dir/runner-\$runtime_name-\$\$"
+        rm -f "\$candidate_gc_root"
+        if "\$AH_NIX_STORE_BIN" --add-root "\$candidate_gc_root" --indirect --realise "\$AH_RUNTIME_ROOT" >/dev/null 2>&1; then
+          export AH_RUNTIME_GC_ROOT="\$candidate_gc_root"
+        else
+          rm -f "\$candidate_gc_root"
+        fi
+      fi
+    fi
+
+    exec "$out/libexec/agent-harbor/ah" "\$@"
+    EOF
+    chmod +x "$out/bin/ah"
 
     runHook postInstall
   '';
