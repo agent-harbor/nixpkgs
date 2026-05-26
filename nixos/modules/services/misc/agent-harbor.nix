@@ -8,6 +8,9 @@
 let
   cfg = config.services.agent-harbor;
   socketPath = "/run/agent-harbor/ah-fs-snapshots-daemon.sock";
+  activationStore = cfg.activationStore;
+  gcRootsDir = cfg.gcRootsDir;
+  daemonGcRoot = "${gcRootsDir}/daemon-${builtins.baseNameOf "${cfg.package}"}";
 in
 {
   meta.maintainers = [ ];
@@ -16,6 +19,25 @@ in
     enable = lib.mkEnableOption "Agent Harbor filesystem snapshots daemon";
 
     package = lib.mkPackageOption pkgs "agent-harbor" { };
+
+    activationStore = lib.mkOption {
+      type = lib.types.str;
+      default = "/var/lib/agent-harbor/activation-store";
+      description = "Filesystem path for Agent Harbor installed-version activation metadata.";
+    };
+
+    gcRootsDir = lib.mkOption {
+      type = lib.types.str;
+      default = "/var/lib/agent-harbor/nix-gcroots";
+      description = "Directory where the NixOS module creates indirect GC-root symlinks for live Agent Harbor runtime roots.";
+    };
+
+    nixStoreBin = lib.mkOption {
+      type = lib.types.str;
+      default = "${pkgs.nix}/bin/nix-store";
+      defaultText = lib.literalExpression ''"${pkgs.nix}/bin/nix-store"'';
+      description = "nix-store executable used to register indirect GC roots for live Agent Harbor package roots.";
+    };
 
     snapshotDaemon = {
       readWritePaths = lib.mkOption {
@@ -34,8 +56,32 @@ in
 
     # Ensure ReadWritePaths directories exist so ProtectSystem=strict
     # mount namespacing does not fail at service start.
-    systemd.tmpfiles.rules =
-      map (p: "d ${p} 0755 root root -") cfg.snapshotDaemon.readWritePaths;
+    systemd.tmpfiles.rules = map (p: "d ${p} 0755 root root -") (
+      cfg.snapshotDaemon.readWritePaths
+      ++ [
+        activationStore
+        gcRootsDir
+      ]
+    );
+
+    system.activationScripts.agentHarborActivateInstalledVersion.text = ''
+      mkdir -p ${lib.escapeShellArg activationStore} ${lib.escapeShellArg gcRootsDir}
+      rm -f ${lib.escapeShellArg daemonGcRoot}
+      ${lib.escapeShellArg cfg.nixStoreBin} --add-root ${lib.escapeShellArg daemonGcRoot} --indirect --realise ${lib.escapeShellArg "${cfg.package}"}
+      export AH_ACTIVATION_STORE=${lib.escapeShellArg activationStore}
+      export AH_RUNTIME_ROOT=${lib.escapeShellArg "${cfg.package}"}
+      export AH_RUNTIME_ROOT_CHANNEL=nix
+      export AH_RUNTIME_GC_ROOT=${lib.escapeShellArg daemonGcRoot}
+      export AH_NIX_GC_ROOTS_DIR=${lib.escapeShellArg gcRootsDir}
+      export AH_NIX_STORE_BIN=${lib.escapeShellArg cfg.nixStoreBin}
+      export AH_BIN=${lib.escapeShellArg "${cfg.package}/bin/ah"}
+      ${lib.escapeShellArg "${cfg.package}/bin/ah"} daemon activate-installed-version \
+        --installed-version-dir ${lib.escapeShellArg "${cfg.package}"} \
+        --storage-mode external-immutable \
+        --runtime-channel nix \
+        --activation-store ${lib.escapeShellArg activationStore} \
+        --runtime-pin ${lib.escapeShellArg daemonGcRoot}
+    '';
 
     # Socket unit — systemd listens on the Unix socket and starts the
     # daemon on first client connection.
@@ -56,6 +102,7 @@ in
     # over a Unix socket passed by systemd.
     systemd.services.ah-fs-snapshots-daemon = {
       description = "Agent Harbor Filesystem Snapshots Daemon";
+      restartIfChanged = false;
       after = [
         "network.target"
         "local-fs.target"
