@@ -35,7 +35,7 @@ in
     nixStoreBin = lib.mkOption {
       type = lib.types.str;
       default = "${pkgs.nix}/bin/nix-store";
-      defaultText = lib.literalExpression ''"${pkgs.nix}/bin/nix-store"'';
+      defaultText = lib.literalExpression ''"''${pkgs.nix}/bin/nix-store"'';
       description = "nix-store executable used to register indirect GC roots for live Agent Harbor package roots.";
     };
 
