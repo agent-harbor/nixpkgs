@@ -15,12 +15,6 @@ on:
       targetSha:
         required: true
         type: string
-    secrets:
-      # Should only be provided in the merge queue, not in pull requests,
-      # where we're evaluating untrusted code.
-      CACHIX_AUTH_TOKEN_GHA:
-        required: false
-
 permissions: {}
 
 defaults:
@@ -120,16 +114,6 @@ jobs:
           merged-as-untrusted-at: ${{ inputs.mergedSha }}
           target-as-trusted-at: ${{ inputs.targetSha }}
 
-      - uses: cachix/install-nix-action@616559265b40713947b9c190a8ff4b507b5df49b # v31.10.4
-
-      - uses: cachix/cachix-action@1eb2ef646ac0255473d23a5907ad7b04ce94065c # v17
-        continue-on-error: true
-        with:
-          # The nixpkgs-gha cache should not be trusted or used outside of Nixpkgs and its forks' CI.
-          name: ${{ vars.CACHIX_NAME || 'nixpkgs-gha' }}
-          extraPullNames: nixpkgs-gha
-          authToken: ${{ secrets.CACHIX_AUTH_TOKEN_GHA }}
-          pushFilter: -source$
 
       - name: Build codeowners validator
         run: nix-build nixpkgs/trusted/ci --arg nixpkgs ./nixpkgs/trusted-pinned -A codeownersValidator

@@ -66,8 +66,6 @@ jobs:
     uses: ./.github/workflows/check.yml
     permissions:
       pull-requests: write # cherry-picks: unused in merge queue but required for check workflow
-    secrets:
-      CACHIX_AUTH_TOKEN_GHA: ${{ secrets.CACHIX_AUTH_TOKEN_GHA }}
     with:
       mergedSha: ${{ needs.prepare.outputs.mergedSha }}
       targetSha: ${{ needs.prepare.outputs.targetSha }}
@@ -76,8 +74,6 @@ jobs:
     name: Lint
     needs: [prepare]
     uses: ./.github/workflows/lint.yml
-    secrets:
-      CACHIX_AUTH_TOKEN_GHA: ${{ secrets.CACHIX_AUTH_TOKEN_GHA }}
     with:
       mergedSha: ${{ needs.prepare.outputs.mergedSha }}
       targetSha: ${{ needs.prepare.outputs.targetSha }}
@@ -91,8 +87,6 @@ jobs:
     permissions:
       pull-requests: write # compare: unused in merge queue but required by eval workflow
       statuses: write # compare: unused in merge queue but required by eval workflow
-    secrets:
-      CACHIX_AUTH_TOKEN_GHA: ${{ secrets.CACHIX_AUTH_TOKEN_GHA }}
     with:
       artifact-prefix: ${{ inputs.artifact-prefix }}
       mergedSha: ${{ needs.prepare.outputs.mergedSha }}
@@ -103,8 +97,6 @@ jobs:
     name: Build
     needs: [prepare]
     uses: ./.github/workflows/build.yml
-    secrets:
-      CACHIX_AUTH_TOKEN_GHA: ${{ secrets.CACHIX_AUTH_TOKEN_GHA }}
     with:
       artifact-prefix: ${{ inputs.artifact-prefix }}
       baseBranch: ${{ needs.prepare.outputs.baseBranch }}
