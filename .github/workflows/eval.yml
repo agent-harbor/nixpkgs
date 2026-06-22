@@ -22,12 +22,6 @@ on:
         required: false
         default: false
         type: boolean
-    secrets:
-      # Should only be provided in the merge queue, not in pull requests,
-      # where we're evaluating untrusted code.
-      CACHIX_AUTH_TOKEN_GHA:
-        required: false
-
 permissions: {}
 
 defaults:
@@ -131,9 +125,12 @@ jobs:
             core.setOutput("ciPinBumpCommitShort", ciPinBumpCommit.substring(0, 7))
             core.info(`Found pinned.json commit: ${ciPinBumpCommit}`)
 
-      - name: Install Nix
-        uses: cachix/install-nix-action@616559265b40713947b9c190a8ff4b507b5df49b # v31.10.4
-
+      - name: Setup Nix
+        uses: metacraft-labs/nixos-modules/.github/setup-nix@main
+        with:
+          trusted-public-keys: ${{ vars.TRUSTED_PUBLIC_KEYS }}
+          substituters: ${{ vars.SUBSTITUTERS }}
+          nix-github-token: ${{ secrets.GITHUB_TOKEN }}
       - name: Load supported versions
         id: versions
         run: |
@@ -179,17 +176,6 @@ jobs:
           untrusted-pin-bump: ${{ matrix.version && needs.versions.outputs.ciPinBumpCommit }}
           target-as-trusted-at: ${{ inputs.targetSha }}
 
-      - name: Install Nix
-        uses: cachix/install-nix-action@616559265b40713947b9c190a8ff4b507b5df49b # v31.10.4
-
-      - uses: cachix/cachix-action@1eb2ef646ac0255473d23a5907ad7b04ce94065c # v17
-        continue-on-error: true
-        with:
-          # The nixpkgs-gha cache should not be trusted or used outside of Nixpkgs and its forks' CI.
-          name: ${{ vars.CACHIX_NAME || 'nixpkgs-gha' }}
-          extraPullNames: nixpkgs-gha
-          authToken: ${{ secrets.CACHIX_AUTH_TOKEN_GHA }}
-          pushFilter: '(-source|-single-chunk)$'
 
       - name: Evaluate the ${{ matrix.system }} output paths at the merge commit
         env:
@@ -269,9 +255,12 @@ jobs:
           path: diff
           merge-multiple: true
 
-      - name: Install Nix
-        uses: cachix/install-nix-action@616559265b40713947b9c190a8ff4b507b5df49b # v31.10.4
-
+      - name: Setup Nix
+        uses: metacraft-labs/nixos-modules/.github/setup-nix@main
+        with:
+          trusted-public-keys: ${{ vars.TRUSTED_PUBLIC_KEYS }}
+          substituters: ${{ vars.SUBSTITUTERS }}
+          nix-github-token: ${{ secrets.GITHUB_TOKEN }}
       - name: Combine all output paths and eval stats
         run: |
           nix-build nixpkgs/trusted/ci --arg nixpkgs ./nixpkgs/trusted-pinned -A eval.combine \
@@ -464,9 +453,12 @@ jobs:
         with:
           merged-as-untrusted-at: ${{ inputs.mergedSha }}
 
-      - name: Install Nix
-        uses: cachix/install-nix-action@616559265b40713947b9c190a8ff4b507b5df49b # v31.10.4
-
+      - name: Setup Nix
+        uses: metacraft-labs/nixos-modules/.github/setup-nix@main
+        with:
+          trusted-public-keys: ${{ vars.TRUSTED_PUBLIC_KEYS }}
+          substituters: ${{ vars.SUBSTITUTERS }}
+          nix-github-token: ${{ secrets.GITHUB_TOKEN }}
       - name: Ensure flake outputs on all systems still evaluate
         run: nix flake check --all-systems --no-build './nixpkgs/untrusted?shallow=1'
 
