@@ -2,15 +2,86 @@
   config,
   lib,
   pkgs,
+  utils,
   ...
 }:
 
 let
   cfg = config.services.agent-harbor;
   socketPath = "/run/agent-harbor/ah-fs-snapshots-daemon.sock";
+  runtimeDir = builtins.dirOf socketPath;
+  zfsCloneRoot = "/tmp/ah-zfs-clones";
+  denyAllZfsDataset = "/";
+  denyAllBtrfsPath = "/dev/null";
   activationStore = cfg.activationStore;
   gcRootsDir = cfg.gcRootsDir;
   daemonGcRoot = "${gcRootsDir}/daemon-${builtins.baseNameOf "${cfg.package}"}";
+
+  accountNameType = lib.types.addCheck lib.types.nonEmptyStr (
+    name: builtins.match "[A-Za-z_][A-Za-z0-9_.-]{0,30}" name != null
+  );
+  isCanonicalAbsolutePath =
+    path:
+    lib.hasPrefix "/" path
+    && (path == "/" || !lib.hasSuffix "/" path)
+    && !lib.hasInfix "//" path
+    && lib.all (segment: segment != "." && segment != "..") (lib.tail (lib.splitString "/" path));
+  isConfinedPath = path: path != "/" && isCanonicalAbsolutePath path;
+  isZfsDataset =
+    dataset:
+    builtins.match "[A-Za-z][A-Za-z0-9_.:-]*(/[A-Za-z0-9_.:-]+)*" dataset != null
+    && lib.all (component: component != "." && component != "..") (lib.splitString "/" dataset);
+
+  # Older compatible daemons may treat an omitted allowlist as unrestricted.
+  # Pass values that cannot identify an operable ZFS dataset or Btrfs path when
+  # the configured list is empty, so every supported version remains deny-all.
+  effectiveAllowedZfsDatasets =
+    if cfg.snapshotDaemon.allowedZfsDatasets == [ ] then
+      [ denyAllZfsDataset ]
+    else
+      lib.unique cfg.snapshotDaemon.allowedZfsDatasets;
+  effectiveAllowedBtrfsPaths =
+    if cfg.snapshotDaemon.allowedBtrfsPaths == [ ] then
+      [ denyAllBtrfsPath ]
+    else
+      lib.unique cfg.snapshotDaemon.allowedBtrfsPaths;
+
+  daemonReadWritePaths = lib.unique (
+    cfg.snapshotDaemon.readWritePaths
+    ++ cfg.snapshotDaemon.allowedBtrfsPaths
+    ++ [
+      runtimeDir
+      zfsCloneRoot
+    ]
+  );
+  managedDirectories = lib.unique (
+    daemonReadWritePaths
+    ++ [
+      activationStore
+      gcRootsDir
+    ]
+  );
+  otherManagedDirectories = lib.filter (path: path != runtimeDir) managedDirectories;
+
+  # toJSON provides systemd-compatible C quoting. Percent signs need separate
+  # escaping because systemd expands specifiers even inside quoted values.
+  escapeSystemdConfigArg = value: lib.replaceStrings [ "%" ] [ "%%" ] (builtins.toJSON value);
+  tmpfilesDirectoryRule =
+    path: mode: group:
+    "d ${escapeSystemdConfigArg path} ${mode} root ${escapeSystemdConfigArg group} -";
+  daemonArgs = [
+    "${cfg.package}/bin/ah-fs-snapshots-daemon"
+    "--socket-path"
+    socketPath
+  ]
+  ++ lib.concatMap (dataset: [
+    "--allowed-zfs-dataset"
+    dataset
+  ]) effectiveAllowedZfsDatasets
+  ++ lib.concatMap (path: [
+    "--allowed-btrfs-path"
+    path
+  ]) effectiveAllowedBtrfsPaths;
 in
 {
   meta.maintainers = [ ];
@@ -18,7 +89,14 @@ in
   options.services.agent-harbor = {
     enable = lib.mkEnableOption "Agent Harbor filesystem snapshots daemon";
 
-    package = lib.mkPackageOption pkgs "agent-harbor" { };
+    package = lib.mkPackageOption pkgs "agent-harbor" {
+      extraDescription = ''
+        It must be version 0.4.0 or newer because the snapshot daemon must
+        support filesystem allowlists. Until the default package is updated,
+        enabling this module requires overriding this option with a compatible
+        package.
+      '';
+    };
 
     activationStore = lib.mkOption {
       type = lib.types.str;
@@ -40,29 +118,125 @@ in
     };
 
     snapshotDaemon = {
+      accessGroup = lib.mkOption {
+        type = accountNameType;
+        default = "agent-harbor";
+        description = ''
+          Group permitted to connect to the privileged snapshot daemon socket.
+          Membership grants control over root-level filesystem snapshot operations
+          and must be limited to trusted users.
+        '';
+      };
+
+      allowedUsers = lib.mkOption {
+        type = lib.types.listOf accountNameType;
+        default = [ ];
+        example = [ "alice" ];
+        description = ''
+          Users to add to the snapshot daemon access group. This is a convenience
+          option; group membership can also be managed through
+          {option}`users.groups`.
+        '';
+      };
+
+      allowedZfsDatasets = lib.mkOption {
+        type = lib.types.listOf lib.types.nonEmptyStr;
+        default = [ ];
+        example = [ "tank/agent-harbor" ];
+        description = ''
+          ZFS dataset prefixes on which the snapshot daemon may operate. Each
+          value is passed as a separate `--allowed-zfs-dataset` argument. The
+          empty default emits an explicit deny-all value; it never starts the
+          daemon without a ZFS allowlist.
+        '';
+      };
+
+      allowedBtrfsPaths = lib.mkOption {
+        type = lib.types.listOf lib.types.nonEmptyStr;
+        default = [ ];
+        example = [ "/var/lib/agent-harbor/btrfs" ];
+        description = ''
+          Absolute Btrfs path prefixes on which the snapshot daemon may operate.
+          Each value is passed as a separate `--allowed-btrfs-path` argument and
+          added to the service's writable paths. The empty default emits an
+          explicit deny-all value; it never starts the daemon without a Btrfs
+          allowlist.
+        '';
+      };
+
       readWritePaths = lib.mkOption {
         type = lib.types.listOf lib.types.str;
         default = [
           "/var/lib/agent-harbor"
           "/run/agent-harbor"
+          zfsCloneRoot
         ];
-        description = "Paths the snapshot daemon is allowed to write to (for mount points and runtime state).";
+        defaultText = lib.literalExpression ''
+          [
+            "/var/lib/agent-harbor"
+            "/run/agent-harbor"
+            "/tmp/ah-zfs-clones"
+          ]
+        '';
+        description = ''
+          Paths the snapshot daemon is allowed to write to for mount points and
+          runtime state. The module always adds its runtime directory and the
+          current daemon's hard-coded `/tmp/ah-zfs-clones` client-visible ZFS
+          clone root. The latter cannot be relocated until the daemon supports
+          configuring its clone staging root.
+        '';
       };
     };
   };
 
   config = lib.mkIf cfg.enable {
+    assertions = [
+      {
+        assertion = (cfg.package ? version) && lib.versionAtLeast cfg.package.version "0.4.0";
+        message = "services.agent-harbor.package must be Agent Harbor 0.4.0 or newer because older daemons do not support filesystem allowlists";
+      }
+      {
+        assertion =
+          !lib.elem cfg.snapshotDaemon.accessGroup [
+            "root"
+            "users"
+            "wheel"
+          ];
+        message = "services.agent-harbor.snapshotDaemon.accessGroup must be a dedicated group, not root, users, or wheel";
+      }
+      {
+        assertion = lib.all isZfsDataset cfg.snapshotDaemon.allowedZfsDatasets;
+        message = "services.agent-harbor.snapshotDaemon.allowedZfsDatasets must contain valid ZFS dataset names without snapshots";
+      }
+      {
+        assertion = lib.all isConfinedPath cfg.snapshotDaemon.allowedBtrfsPaths;
+        message = "services.agent-harbor.snapshotDaemon.allowedBtrfsPaths must contain canonical absolute paths other than /";
+      }
+      {
+        assertion = lib.all isConfinedPath cfg.snapshotDaemon.readWritePaths;
+        message = "services.agent-harbor.snapshotDaemon.readWritePaths must contain canonical absolute paths other than /";
+      }
+      {
+        assertion = isConfinedPath activationStore;
+        message = "services.agent-harbor.activationStore must be a canonical absolute path other than /";
+      }
+      {
+        assertion = isConfinedPath gcRootsDir;
+        message = "services.agent-harbor.gcRootsDir must be a canonical absolute path other than /";
+      }
+    ];
+
     environment.systemPackages = [ cfg.package ];
+
+    users.groups.${cfg.snapshotDaemon.accessGroup}.members = lib.mkAfter (
+      lib.unique cfg.snapshotDaemon.allowedUsers
+    );
 
     # Ensure ReadWritePaths directories exist so ProtectSystem=strict
     # mount namespacing does not fail at service start.
-    systemd.tmpfiles.rules = map (p: "d ${p} 0755 root root -") (
-      cfg.snapshotDaemon.readWritePaths
-      ++ [
-        activationStore
-        gcRootsDir
-      ]
-    );
+    systemd.tmpfiles.rules =
+      map (path: tmpfilesDirectoryRule path "0755" "root") otherManagedDirectories
+      ++ [ (tmpfilesDirectoryRule runtimeDir "0750" cfg.snapshotDaemon.accessGroup) ];
 
     system.activationScripts.agentHarborActivateInstalledVersion.text = ''
       mkdir -p ${lib.escapeShellArg activationStore} ${lib.escapeShellArg gcRootsDir}
@@ -91,8 +265,10 @@ in
 
       socketConfig = {
         ListenStream = socketPath;
-        SocketMode = "0666";
-        DirectoryMode = "0755";
+        SocketUser = "root";
+        SocketGroup = cfg.snapshotDaemon.accessGroup;
+        SocketMode = "0660";
+        DirectoryMode = "0750";
         RemoveOnStop = true;
       };
     };
@@ -109,10 +285,23 @@ in
       ];
       wants = [ "zfs.target" ];
       requires = [ "ah-fs-snapshots-daemon.socket" ];
+      path = [
+        pkgs.zfs
+        pkgs.btrfs-progs
+        pkgs.util-linux
+        pkgs.coreutils
+      ];
+      preStart = ''
+        daemon_help="$(${cfg.package}/bin/ah-fs-snapshots-daemon --help)"
+        ${pkgs.gnugrep}/bin/grep -Fq -- '--allowed-zfs-dataset' <<<"$daemon_help"
+        ${pkgs.gnugrep}/bin/grep -Fq -- '--allowed-btrfs-path' <<<"$daemon_help"
+      '';
 
       serviceConfig = {
         Type = "notify";
-        ExecStart = "${cfg.package}/bin/ah-fs-snapshots-daemon --socket-path ${socketPath}";
+        User = "root";
+        Group = "root";
+        ExecStart = utils.escapeSystemdExecArgs daemonArgs;
         Restart = "on-failure";
         RestartSec = 5;
         TimeoutStopSec = 30;
@@ -121,8 +310,12 @@ in
         NoNewPrivileges = false; # needs CAP_SYS_ADMIN for mounts
         ProtectSystem = "strict";
         ProtectHome = "read-only";
-        PrivateTmp = true;
-        ReadWritePaths = cfg.snapshotDaemon.readWritePaths;
+        # ZFS clone paths are returned to unprivileged clients. The daemon
+        # currently hard-codes /tmp/ah-zfs-clones, so a private /tmp would make
+        # successful clone mounts invisible to those clients. ProtectSystem and
+        # ReadWritePaths keep the shared /tmp read-only outside the managed root.
+        PrivateTmp = false;
+        ReadWritePaths = map escapeSystemdConfigArg daemonReadWritePaths;
         RestrictAddressFamilies = [
           "AF_UNIX"
           "AF_LOCAL"
