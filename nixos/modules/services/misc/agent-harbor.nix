@@ -16,6 +16,7 @@ let
   activationStore = cfg.activationStore;
   gcRootsDir = cfg.gcRootsDir;
   daemonGcRoot = "${gcRootsDir}/daemon-${builtins.baseNameOf "${cfg.package}"}";
+  packageVersion = if cfg.package ? version then cfg.package.version else null;
 
   accountNameType = lib.types.addCheck lib.types.nonEmptyStr (
     name: builtins.match "[A-Za-z_][A-Za-z0-9_.-]{0,30}" name != null
@@ -54,21 +55,23 @@ let
       zfsCloneRoot
     ]
   );
-  managedDirectories = lib.unique (
-    daemonReadWritePaths
-    ++ [
-      activationStore
-      gcRootsDir
-    ]
+  moduleManagedDirectories = lib.unique [
+    activationStore
+    gcRootsDir
+    runtimeDir
+    zfsCloneRoot
+  ];
+  operatorManagedDirectories = lib.filter (path: !lib.elem path moduleManagedDirectories) (
+    lib.unique (cfg.snapshotDaemon.readWritePaths ++ cfg.snapshotDaemon.allowedBtrfsPaths)
   );
-  otherManagedDirectories = lib.filter (path: path != runtimeDir) managedDirectories;
+  otherModuleManagedDirectories = lib.filter (path: path != runtimeDir) moduleManagedDirectories;
 
   # toJSON provides systemd-compatible C quoting. Percent signs need separate
   # escaping because systemd expands specifiers even inside quoted values.
   escapeSystemdConfigArg = value: lib.replaceStrings [ "%" ] [ "%%" ] (builtins.toJSON value);
   tmpfilesDirectoryRule =
-    path: mode: group:
-    "d ${escapeSystemdConfigArg path} ${mode} root ${escapeSystemdConfigArg group} -";
+    path: mode: user: group:
+    "d ${escapeSystemdConfigArg path} ${mode} ${escapeSystemdConfigArg user} ${escapeSystemdConfigArg group} -";
   daemonArgs = [
     "${cfg.package}/bin/ah-fs-snapshots-daemon"
     "--socket-path"
@@ -91,10 +94,12 @@ in
 
     package = lib.mkPackageOption pkgs "agent-harbor" {
       extraDescription = ''
-        It must be version 0.4.0 or newer because the snapshot daemon must
-        support filesystem allowlists. Until the default package is updated,
-        enabling this module requires overriding this option with a compatible
-        package.
+        Packages with a declared version must be version 0.4.0 or newer because
+        the snapshot daemon must support filesystem allowlists. Versionless
+        derivations and store paths are accepted, and the service verifies the
+        required allowlist flags before starting the daemon. Until the default
+        package is updated, enabling this module requires overriding this option
+        with a compatible package.
       '';
     };
 
@@ -158,9 +163,10 @@ in
         description = ''
           Absolute Btrfs path prefixes on which the snapshot daemon may operate.
           Each value is passed as a separate `--allowed-btrfs-path` argument and
-          added to the service's writable paths. The empty default emits an
-          explicit deny-all value; it never starts the daemon without a Btrfs
-          allowlist.
+          added to the service's writable paths. Missing directories are created
+          as root with mode 0755, while existing ownership and modes are
+          preserved. The empty default emits an explicit deny-all value; it never
+          starts the daemon without a Btrfs allowlist.
         '';
       };
 
@@ -180,10 +186,11 @@ in
         '';
         description = ''
           Paths the snapshot daemon is allowed to write to for mount points and
-          runtime state. The module always adds its runtime directory and the
-          current daemon's hard-coded `/tmp/ah-zfs-clones` client-visible ZFS
-          clone root. The latter cannot be relocated until the daemon supports
-          configuring its clone staging root.
+          runtime state. Missing directories are created as root with mode 0755,
+          while existing ownership and modes are preserved. The module always
+          adds its runtime directory and the current daemon's hard-coded
+          `/tmp/ah-zfs-clones` client-visible ZFS clone root. The latter cannot be
+          relocated until the daemon supports configuring its clone staging root.
         '';
       };
     };
@@ -192,8 +199,10 @@ in
   config = lib.mkIf cfg.enable {
     assertions = [
       {
-        assertion = (cfg.package ? version) && lib.versionAtLeast cfg.package.version "0.4.0";
-        message = "services.agent-harbor.package must be Agent Harbor 0.4.0 or newer because older daemons do not support filesystem allowlists";
+        assertion =
+          packageVersion == null
+          || (builtins.isString packageVersion && lib.versionAtLeast packageVersion "0.4.0");
+        message = "services.agent-harbor.package has a known version older than 0.4.0 and does not support filesystem allowlists";
       }
       {
         assertion =
@@ -232,11 +241,12 @@ in
       lib.unique cfg.snapshotDaemon.allowedUsers
     );
 
-    # Ensure ReadWritePaths directories exist so ProtectSystem=strict
-    # mount namespacing does not fail at service start.
+    # Create operator-provided paths when absent, but never replace their
+    # existing ownership or mode. Module-owned paths retain fixed metadata.
     systemd.tmpfiles.rules =
-      map (path: tmpfilesDirectoryRule path "0755" "root") otherManagedDirectories
-      ++ [ (tmpfilesDirectoryRule runtimeDir "0750" cfg.snapshotDaemon.accessGroup) ];
+      map (path: tmpfilesDirectoryRule path ":0755" ":root" ":root") operatorManagedDirectories
+      ++ map (path: tmpfilesDirectoryRule path "0755" "root" "root") otherModuleManagedDirectories
+      ++ [ (tmpfilesDirectoryRule runtimeDir "0750" "root" cfg.snapshotDaemon.accessGroup) ];
 
     system.activationScripts.agentHarborActivateInstalledVersion.text = ''
       mkdir -p ${lib.escapeShellArg activationStore} ${lib.escapeShellArg gcRootsDir}
