@@ -214,6 +214,7 @@ in
   alloy = runTest ./alloy.nix;
   allTerminfo = runTest ./all-terminfo.nix;
   alps = runTest ./alps.nix;
+  agent-harbor = runTest ./agent-harbor.nix;
   amazon-cloudwatch-agent = runTest ./amazon-cloudwatch-agent.nix;
   amazon-init-shell = runTest ./amazon-init-shell.nix;
   amazon-ssm-agent = runTest ./amazon-ssm-agent.nix;
