@@ -7,6 +7,7 @@
 let
   socketPath = "/run/agent-harbor/ah-fs-snapshots-daemon.sock";
   difficultBtrfsPath = "/srv/agent harbor/%n/$NOT_EXPANDED;\"quoted\"";
+  explicitReadWritePath = "/srv/agent-harbor-existing-writable";
 
   fakeAh = pkgs.writeShellScriptBin "ah" ''
     exit 0
@@ -46,14 +47,28 @@ let
     exec ${pkgs.coreutils}/bin/sleep infinity
   '';
 
-  testPackage = pkgs.symlinkJoin {
-    pname = "agent-harbor-test-package";
-    version = "0.5.0";
-    paths = [
-      fakeAh
-      fakeSnapshotDaemon
-    ];
-  };
+  fakeIncompatibleSnapshotDaemon = pkgs.writeShellScriptBin "ah-fs-snapshots-daemon" ''
+    set -eu
+
+    if [ "''${1:-}" = "--help" ]; then
+      printf '%s\n' 'Usage: ah-fs-snapshots-daemon [OPTIONS]'
+      exit 0
+    fi
+
+    ${pkgs.coreutils}/bin/touch /run/agent-harbor/incompatible-daemon-started
+    exit 1
+  '';
+
+  mkVersionlessTestPackage =
+    name: snapshotDaemon:
+    pkgs.runCommand name { } ''
+      mkdir -p "$out/bin"
+      ln -s ${fakeAh}/bin/ah "$out/bin/ah"
+      ln -s ${snapshotDaemon}/bin/ah-fs-snapshots-daemon "$out/bin/ah-fs-snapshots-daemon"
+    '';
+
+  testPackage = mkVersionlessTestPackage "agent-harbor-test-package" fakeSnapshotDaemon;
+  incompatibleTestPackage = mkVersionlessTestPackage "agent-harbor-incompatible-test-package" fakeIncompatibleSnapshotDaemon;
 
   # Keep negative module evaluations independent of the test driver's `pkgs`
   # fixpoint; feeding that package set back through eval-config recurses.
@@ -61,17 +76,16 @@ let
     system = builtins.currentSystem;
     config.allowUnfree = true;
   };
-  evalTestPackage =
-    evalPkgs.runCommand "agent-harbor-eval-test-package-0.5.0"
-      {
-        version = "0.5.0";
-      }
-      ''
-        mkdir -p "$out/bin"
-      '';
+  evalVersionlessPackage = evalPkgs.runCommand "agent-harbor-eval-versionless-package" { } ''
+    mkdir -p "$out/bin"
+  '';
+  evalStorePathPackage = builtins.storePath (builtins.toFile "agent-harbor-eval-store-path" "");
+  evalCompatibleVersionedPackage = evalVersionlessPackage // {
+    version = "0.5.0";
+  };
   baseServiceConfig = {
     enable = true;
-    package = evalTestPackage;
+    package = evalVersionlessPackage;
     snapshotDaemon = {
       accessGroup = "ah-snapshot-access";
       allowedZfsDatasets = [ "tank/valid" ];
@@ -100,7 +114,10 @@ let
       builtins.deepSeq (evalConfiguration overrides).config.system.build.toplevel.drvPath true
     )).success;
 in
+assert !(evalVersionlessPackage ? version);
 assert evaluationSucceeds { };
+assert evaluationSucceeds { package = evalStorePathPackage; };
+assert evaluationSucceeds { package = evalCompatibleVersionedPackage; };
 assert !evaluationSucceeds { package = evalPkgs.agent-harbor; };
 assert !evaluationSucceeds { snapshotDaemon.accessGroup = "root"; };
 assert !evaluationSucceeds { snapshotDaemon.allowedZfsDatasets = [ "tank/valid@snapshot" ]; };
@@ -139,8 +156,19 @@ assert !evaluationSucceeds { gcRootsDir = "/var/lib/../escaped"; };
           readWritePaths = [
             "/var/lib/agent-harbor"
             "/run/agent-harbor"
+            explicitReadWritePath
           ];
         };
+      };
+
+      # These paths represent operator-managed mount roots. The module may
+      # create them when absent, but must preserve metadata when they exist.
+      system.activationScripts.prepareAgentHarborOperatorPaths = {
+        deps = [ "users" ];
+        text = ''
+          install -d -m 0710 -o alice -g users ${lib.escapeShellArg difficultBtrfsPath}
+          install -d -m 0730 -o carol -g users ${lib.escapeShellArg explicitReadWritePath}
+        '';
       };
 
       users.users = {
@@ -161,6 +189,17 @@ assert !evaluationSucceeds { gcRootsDir = "/var/lib/../escaped"; };
         };
       };
     };
+
+    incompatible = {
+      services.agent-harbor = {
+        enable = true;
+        package = incompatibleTestPackage;
+        snapshotDaemon.accessGroup = "ah-incompatible-access";
+      };
+
+      # Keep the failure terminal so the test can inspect the rejected start.
+      systemd.services.ah-fs-snapshots-daemon.serviceConfig.Restart = lib.mkForce "no";
+    };
   };
 
   testScript = ''
@@ -169,6 +208,7 @@ assert !evaluationSucceeds { gcRootsDir = "/var/lib/../escaped"; };
 
     socket_path = ${builtins.toJSON socketPath}
     difficult_path = ${builtins.toJSON difficultBtrfsPath}
+    explicit_read_write_path = ${builtins.toJSON explicitReadWritePath}
 
     def connect_command(user):
         program = (
@@ -236,6 +276,16 @@ assert !evaluationSucceeds { gcRootsDir = "/var/lib/../escaped"; };
         ).strip()
         assert private_tmp == "no", private_tmp
 
+    with subtest("tmpfiles preserves operator-managed directory metadata"):
+        btrfs_metadata = machine.succeed(
+            f"stat -c '%a %U %G' {shlex.quote(difficult_path)}"
+        ).strip()
+        read_write_metadata = machine.succeed(
+            f"stat -c '%a %U %G' {shlex.quote(explicit_read_write_path)}"
+        ).strip()
+        assert btrfs_metadata == "710 alice users", btrfs_metadata
+        assert read_write_metadata == "730 carol users", read_write_metadata
+
     with subtest("daemon receives exact deduplicated allowlist arguments"):
         machine.wait_for_file("/run/agent-harbor/daemon-args")
         args = read_nul_args(machine, "/run/agent-harbor/daemon-args")
@@ -294,5 +344,18 @@ assert !evaluationSucceeds { gcRootsDir = "/var/lib/../escaped"; };
             "/dev/null",
         ], args
         assert "--unrestricted" not in args, args
+
+    incompatible.start()
+
+    with subtest("pre-start capability probe rejects a versionless incompatible daemon"):
+        incompatible.wait_for_unit("ah-fs-snapshots-daemon.socket")
+        incompatible.fail("systemctl start ah-fs-snapshots-daemon.service")
+        incompatible.fail("systemctl is-active --quiet ah-fs-snapshots-daemon.service")
+        incompatible.fail("test -e /run/agent-harbor/incompatible-daemon-started")
+        pre_start_status = incompatible.succeed(
+            "systemctl show --property=ExecStartPre --value ah-fs-snapshots-daemon.service"
+        )
+        assert "code=exited" in pre_start_status, pre_start_status
+        assert "status=1" in pre_start_status, pre_start_status
   '';
 }
