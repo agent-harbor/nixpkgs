@@ -101,7 +101,10 @@ let
         {
           nixpkgs.pkgs = evalPkgs;
           system.stateVersion = "25.05";
-          fileSystems."/".device = "/dev/vda";
+          fileSystems."/" = {
+            device = "/dev/vda";
+            fsType = "ext4";
+          };
           boot.loader.grub.device = "/dev/vda";
           services.agent-harbor = lib.recursiveUpdate baseServiceConfig overrides;
         }
