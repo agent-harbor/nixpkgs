@@ -15,7 +15,7 @@ let
   sources = {
     x86_64-linux = {
       url = "https://downloads.agent-harbor.com/linux/v${version}/agent-harbor-portable-${version}-x86_64-linux.tar.gz";
-      hash = "sha256-Jofeh1sHdADEEGf8dspJfN7hJ8vREqz5FZu+pbCjltM="; # x86_64
+      hash = "sha256-pJYa2Dw7WiWcDz/y9nXmMFAbFQUnbqFfTnLObkhbVks="; # x86_64
     };
     # aarch64-linux: not yet published; add here when available
   };
