@@ -10,12 +10,12 @@ let
 
   # Pre-built musl-static binaries from the Agent Harbor release pipeline.
   # No autoPatchelfHook needed — binaries are fully statically linked.
-  version = "0.3.19";
+  version = "0.6.0";
 
   sources = {
     x86_64-linux = {
       url = "https://downloads.agent-harbor.com/linux/v${version}/agent-harbor-portable-${version}-x86_64-linux.tar.gz";
-      hash = "sha256-BDDptvz5Z1wQZoXp/shp3VzQF8OMILk/gJO4W7CS87M="; # x86_64
+      hash = "sha256-Jofeh1sHdADEEGf8dspJfN7hJ8vREqz5FZu+pbCjltM="; # x86_64
     };
     # aarch64-linux: not yet published; add here when available
   };
@@ -49,11 +49,21 @@ stdenv.mkDerivation {
       install -m 0755 "bin/ah" "$out/libexec/agent-harbor/ah"
     fi
 
-    for bin in ah-fs-snapshots-daemon agentfs-fuse; do
+    for bin in ah-fs-snapshots-daemon agentharborfs-fuse agentharborfs-daemon agentfs-fuse; do
       if [ -f "bin/$bin" ]; then
         install -m 0755 "bin/$bin" "$out/bin/$bin"
       fi
     done
+
+    if [ -d "lib" ]; then
+      mkdir -p "$out/lib"
+      cp -a lib/. "$out/lib/"
+    fi
+
+    if [ -d "share" ]; then
+      mkdir -p "$out/share"
+      cp -a share/. "$out/share/"
+    fi
 
     cat > "$out/bin/ah" <<EOF
     #!${stdenv.shell}
