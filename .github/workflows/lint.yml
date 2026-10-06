@@ -30,7 +30,7 @@ jobs:
           merged-as-untrusted-at: ${{ inputs.mergedSha }}
 
       - name: Setup Nix
-        uses: metacraft-labs/devops-modules/.github/setup-nix@dev
+        uses: metacraft-labs/devops-modules/.github/setup-nix@572f9d999c0f22f6e6a16152d79359976f1298c8 # dev
         with:
           trusted-public-keys: ${{ vars.TRUSTED_PUBLIC_KEYS }}
           substituters: ${{ vars.SUBSTITUTERS }}
