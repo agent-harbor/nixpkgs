@@ -129,11 +129,19 @@ stdenv.mkDerivation {
       ln -s ${lib.getExe slirp4netns} "${runtimeBinDir}/slirp4netns"
     ''}
     ${lib.optionalString (claudeAcp != null) ''
-      # Point the adapter's SDK at nixpkgs' patched `claude`: left to itself it
-      # may run the native binary bundled in its npm package, which is linked
-      # against /lib64/ld-linux-x86-64.so.2 and cannot start on NixOS.
-      makeWrapper ${lib.getExe claudeAcp} "${runtimeBinDir}/claude-code-acp" \
-        --set-default CLAUDE_CODE_EXECUTABLE ${lib.getExe claude-code}
+      # An adapter that bundles its own JavaScript Claude Code CLI (cli.js) must
+      # keep it: its SDK parses exactly that CLI's messages, and a newer `claude`
+      # emits types it rejects, failing turns that succeeded (claude-code-acp
+      # 0.10.6 with claude-code 2.1.81, measured 2026-10-08). Only an adapter
+      # without one falls back to a bundled native binary linked against
+      # /lib64/ld-linux-x86-64.so.2, which cannot start on NixOS; point that
+      # kind at nixpkgs' patched `claude`.
+      if find ${claudeAcp}/lib -path '*@anthropic-ai/claude-agent-sdk/cli.js' -print -quit | grep -q .; then
+        makeWrapper ${lib.getExe claudeAcp} "${runtimeBinDir}/claude-code-acp"
+      else
+        makeWrapper ${lib.getExe claudeAcp} "${runtimeBinDir}/claude-code-acp" \
+          --set-default CLAUDE_CODE_EXECUTABLE ${lib.getExe claude-code}
+      fi
     ''}
 
     cat > "$out/bin/ah" <<EOF
