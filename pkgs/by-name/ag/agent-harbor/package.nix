@@ -2,7 +2,14 @@
   lib,
   stdenv,
   fetchurl,
+  makeWrapper,
   nix,
+  slirp4netns,
+  claude-code,
+  # The ACP adapter for Claude Code was renamed upstream; older package sets
+  # carry `claude-code-acp`, newer ones `claude-agent-acp`, some neither.
+  claude-code-acp ? null,
+  claude-agent-acp ? null,
 }:
 
 let
@@ -40,6 +47,18 @@ let
   };
 
   source = sources.${system} or (throw "agent-harbor: unsupported platform ${system}");
+
+  claudeAcp = if claude-code-acp != null then claude-code-acp else claude-agent-acp;
+
+  # Programs `ah` runs by name that the portable release cannot bundle:
+  #  - slirp4netns: user-mode networking for sandboxed agents. Every
+  #    LLM-backed agent needs network egress, and without it on PATH the
+  #    sandbox refuses to launch the agent at all (Linux only).
+  #  - claude-code-acp: the ACP adapter `ah` drives Claude Code sessions
+  #    through. Missing, every `--agent claude` session fails to spawn.
+  # They live in a private directory APPENDED to PATH, so a user's own,
+  # possibly newer, installs still take precedence.
+  runtimeBinDir = "$out/libexec/agent-harbor/runtime-bin";
 in
 
 stdenv.mkDerivation {
@@ -49,6 +68,8 @@ stdenv.mkDerivation {
   src = fetchurl { inherit (source) url hash; };
 
   inherit (source) sourceRoot;
+
+  nativeBuildInputs = [ makeWrapper ];
 
   # Prebuilt release binaries — nothing to patch or strip
   dontStrip = true;
@@ -103,9 +124,23 @@ stdenv.mkDerivation {
       cp -a share/. "$out/share/"
     fi
 
+    mkdir -p "${runtimeBinDir}"
+    ${lib.optionalString stdenv.hostPlatform.isLinux ''
+      ln -s ${lib.getExe slirp4netns} "${runtimeBinDir}/slirp4netns"
+    ''}
+    ${lib.optionalString (claudeAcp != null) ''
+      # Point the adapter's SDK at nixpkgs' patched `claude`: left to itself it
+      # may run the native binary bundled in its npm package, which is linked
+      # against /lib64/ld-linux-x86-64.so.2 and cannot start on NixOS.
+      makeWrapper ${lib.getExe claudeAcp} "${runtimeBinDir}/claude-code-acp" \
+        --set-default CLAUDE_CODE_EXECUTABLE ${lib.getExe claude-code}
+    ''}
+
     cat > "$out/bin/ah" <<EOF
     #!${stdenv.shell}
     set -u
+
+    export PATH="\''${PATH:+\$PATH:}${runtimeBinDir}"
 
     export AH_RUNTIME_ROOT="\''${AH_RUNTIME_ROOT:-$out}"
     export AH_RUNTIME_ROOT_CHANNEL="\''${AH_RUNTIME_ROOT_CHANNEL:-nix}"
