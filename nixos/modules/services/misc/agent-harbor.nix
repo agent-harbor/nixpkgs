@@ -8,7 +8,10 @@
 
 let
   cfg = config.services.agent-harbor;
-  socketPath = "/run/agent-harbor/ah-fs-snapshots-daemon.sock";
+  # The machine-wide socket every `ah` client on Linux resolves
+  # (LINUX_SYSTEM_SOCKET_DIR in agent-harbor's crates/ah-domain-types). Not
+  # under /run/agent-harbor: the enrollment daemon owns that directory.
+  socketPath = "/run/agentharborfsd/ah-fs-snapshots-daemon";
   runtimeDir = builtins.dirOf socketPath;
   zfsCloneRoot = "/tmp/ah-zfs-clones";
   denyAllZfsDataset = "/";
@@ -47,14 +50,6 @@ let
     else
       lib.unique cfg.snapshotDaemon.allowedBtrfsPaths;
 
-  daemonReadWritePaths = lib.unique (
-    cfg.snapshotDaemon.readWritePaths
-    ++ cfg.snapshotDaemon.allowedBtrfsPaths
-    ++ [
-      runtimeDir
-      zfsCloneRoot
-    ]
-  );
   moduleManagedDirectories = lib.unique [
     activationStore
     gcRootsDir
@@ -174,23 +169,24 @@ in
         type = lib.types.listOf lib.types.str;
         default = [
           "/var/lib/agent-harbor"
-          "/run/agent-harbor"
           zfsCloneRoot
         ];
         defaultText = lib.literalExpression ''
           [
             "/var/lib/agent-harbor"
-            "/run/agent-harbor"
             "/tmp/ah-zfs-clones"
           ]
         '';
         description = ''
-          Paths the snapshot daemon is allowed to write to for mount points and
-          runtime state. Missing directories are created as root with mode 0755,
-          while existing ownership and modes are preserved. The module always
-          adds its runtime directory and the current daemon's hard-coded
-          `/tmp/ah-zfs-clones` client-visible ZFS clone root. The latter cannot be
-          relocated until the daemon supports configuring its clone staging root.
+          Directories the snapshot daemon uses for mount points and state.
+          Missing directories are created as root with mode 0755, while existing
+          ownership and modes are preserved. The module always adds the current
+          daemon's hard-coded `/tmp/ah-zfs-clones` client-visible ZFS clone root.
+
+          This list does not confine the daemon. Confining a service's writes
+          under systemd (`ProtectSystem=` with `ReadWritePaths=`) gives it a
+          private mount namespace, and the clones and snapshots the daemon
+          mounts there would never be visible to the users it mounts them for.
         '';
       };
     };
@@ -316,16 +312,25 @@ in
         RestartSec = 5;
         TimeoutStopSec = 30;
 
-        # Security hardening
-        NoNewPrivileges = false; # needs CAP_SYS_ADMIN for mounts
-        ProtectSystem = "strict";
-        ProtectHome = "read-only";
-        # ZFS clone paths are returned to unprivileged clients. The daemon
-        # currently hard-codes /tmp/ah-zfs-clones, so a private /tmp would make
-        # successful clone mounts invisible to those clients. ProtectSystem and
-        # ReadWritePaths keep the shared /tmp read-only outside the managed root.
+        # The daemon exists to install mounts (ZFS clones, Btrfs snapshots)
+        # that the requesting user's processes must see, so it has to run in
+        # the host's mount namespace. Every filesystem-namespacing option --
+        # ProtectSystem, ProtectHome, PrivateTmp, ReadWritePaths, BindPaths,
+        # PrivateMounts -- gives it a private one in which its mounts never
+        # reach the host, even with MountFlags=shared (measured on systemd
+        # 257). Against a root process holding CAP_SYS_ADMIN they would buy
+        # little anyway. Only hardening that leaves the mount namespace alone
+        # is applied.
+        PrivateMounts = false;
         PrivateTmp = false;
-        ReadWritePaths = map escapeSystemdConfigArg daemonReadWritePaths;
+        # Not a capability control: the daemon spawns processes for users
+        # (elevated runs, sandbox launches) that may need setuid helpers such
+        # as newuidmap, which no_new_privs would silently neuter.
+        NoNewPrivileges = false;
+        LockPersonality = true;
+        RestrictRealtime = true;
+        RestrictSUIDSGID = true;
+        SystemCallArchitectures = "native";
         RestrictAddressFamilies = [
           "AF_UNIX"
           "AF_LOCAL"
