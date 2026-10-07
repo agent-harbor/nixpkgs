@@ -5,7 +5,8 @@
 }:
 
 let
-  socketPath = "/run/agent-harbor/ah-fs-snapshots-daemon.sock";
+  socketPath = "/run/agentharborfsd/ah-fs-snapshots-daemon";
+  runtimeDir = "/run/agentharborfsd";
   difficultBtrfsPath = "/srv/agent harbor/%n/$NOT_EXPANDED;\"quoted\"";
   explicitReadWritePath = "/srv/agent-harbor-existing-writable";
 
@@ -24,24 +25,24 @@ let
       exit 0
     fi
 
-    printf '%s\0' "$@" > /run/agent-harbor/daemon-args
+    printf '%s\0' "$@" > /run/agentharborfsd/daemon-args
 
     for executable in zfs btrfs mount stat; do
       resolved="$(command -v "$executable")"
       printf '%s=%s\n' "$executable" "$resolved"
-    done > /run/agent-harbor/runtime-tools
-
-    if ${pkgs.coreutils}/bin/touch /tmp/agent-harbor-unmanaged-write 2>/run/agent-harbor/unmanaged-tmp-error; then
-      printf 'unexpectedly wrote to unmanaged shared tmp\n' > /run/agent-harbor/probe-error
-      exit 1
-    fi
-    if ${pkgs.coreutils}/bin/touch /etc/agent-harbor-unmanaged-write 2>/run/agent-harbor/unmanaged-etc-error; then
-      printf 'unexpectedly wrote to /etc\n' > /run/agent-harbor/probe-error
-      exit 1
-    fi
+    done > /run/agentharborfsd/runtime-tools
 
     ${pkgs.coreutils}/bin/touch /tmp/ah-zfs-clones/service-visible
     ${pkgs.coreutils}/bin/touch ${lib.escapeShellArg "${difficultBtrfsPath}/service-visible"}
+
+    # What the real daemon does for every cow-overlay workspace: mount a clone
+    # or snapshot for the requesting user. Those mounts must be visible on the
+    # host, i.e. the service must not run in a private mount namespace.
+    for root in /tmp/ah-zfs-clones ${lib.escapeShellArg difficultBtrfsPath}; do
+      ${pkgs.coreutils}/bin/mkdir -p "$root/mount-probe"
+      ${pkgs.util-linux}/bin/mount -t tmpfs ah-mount-probe "$root/mount-probe"
+      ${pkgs.coreutils}/bin/touch "$root/mount-probe/inside"
+    done
 
     ${pkgs.systemd}/bin/systemd-notify --pid=parent --ready
     exec ${pkgs.coreutils}/bin/sleep infinity
@@ -55,7 +56,7 @@ let
       exit 0
     fi
 
-    ${pkgs.coreutils}/bin/touch /run/agent-harbor/incompatible-daemon-started
+    ${pkgs.coreutils}/bin/touch /run/agentharborfsd/incompatible-daemon-started
     exit 1
   '';
 
@@ -82,6 +83,11 @@ let
   evalStorePathPackage = builtins.storePath (builtins.toFile "agent-harbor-eval-store-path" "");
   evalCompatibleVersionedPackage = evalVersionlessPackage // {
     version = "0.5.0";
+  };
+  # Releases before 0.4.0 have no filesystem allowlists and must be refused,
+  # the default package of this branch (0.3.19) included.
+  evalIncompatibleVersionedPackage = evalVersionlessPackage // {
+    version = "0.3.19";
   };
   baseServiceConfig = {
     enable = true;
@@ -122,6 +128,7 @@ assert evaluationSucceeds { };
 assert evaluationSucceeds { package = evalStorePathPackage; };
 assert evaluationSucceeds { package = evalCompatibleVersionedPackage; };
 assert !evaluationSucceeds { package = evalPkgs.agent-harbor; };
+assert !evaluationSucceeds { package = evalIncompatibleVersionedPackage; };
 assert !evaluationSucceeds { snapshotDaemon.accessGroup = "root"; };
 assert !evaluationSucceeds { snapshotDaemon.allowedZfsDatasets = [ "tank/valid@snapshot" ]; };
 assert !evaluationSucceeds { snapshotDaemon.allowedZfsDatasets = [ "tank/../escaped" ]; };
@@ -158,7 +165,6 @@ assert !evaluationSucceeds { gcRootsDir = "/var/lib/../escaped"; };
           # an operator replaces the additional writable paths.
           readWritePaths = [
             "/var/lib/agent-harbor"
-            "/run/agent-harbor"
             explicitReadWritePath
           ];
         };
@@ -210,6 +216,7 @@ assert !evaluationSucceeds { gcRootsDir = "/var/lib/../escaped"; };
     import shlex
 
     socket_path = ${builtins.toJSON socketPath}
+    runtime_dir = ${builtins.toJSON runtimeDir}
     difficult_path = ${builtins.toJSON difficultBtrfsPath}
     explicit_read_write_path = ${builtins.toJSON explicitReadWritePath}
 
@@ -252,7 +259,7 @@ assert !evaluationSucceeds { gcRootsDir = "/var/lib/../escaped"; };
         machine.wait_for_file(socket_path)
 
         runtime_metadata = machine.succeed(
-            "stat -c '%a %U %G' /run/agent-harbor"
+            f"stat -c '%a %U %G' {shlex.quote(runtime_dir)}"
         ).strip()
         socket_metadata = machine.succeed(
             f"stat -c '%a %U %G' {shlex.quote(socket_path)}"
@@ -265,12 +272,15 @@ assert !evaluationSucceeds { gcRootsDir = "/var/lib/../escaped"; };
         machine.succeed(connect_command("alice"))
         machine.wait_for_unit("ah-fs-snapshots-daemon.service")
 
-    with subtest("generated unit preserves confinement and literal specifiers"):
+    with subtest("generated unit shares the host mount namespace and keeps literal specifiers"):
         unit = machine.succeed("systemctl cat ah-fs-snapshots-daemon.service")
+        for directive in ("ProtectSystem=", "ProtectHome=", "ReadWritePaths=", "BindPaths="):
+            assert directive not in unit, (directive, unit)
         assert "PrivateTmp=false" in unit, unit
-        assert "ProtectSystem=strict" in unit, unit
-        assert "/tmp/ah-zfs-clones" in unit, unit
-        assert "/srv/agent harbor/%%n/$NOT_EXPANDED" in unit, unit
+        assert "PrivateMounts=false" in unit, unit
+        # systemd's own escaping ($ -> $$, % -> %%); the exact unescaped value
+        # the daemon receives is asserted in the allowlist-arguments subtest.
+        assert "/srv/agent harbor/%%n/$$NOT_EXPANDED" in unit, unit
         assert "--unrestricted" not in unit, unit
 
         machine.succeed(f"test -d {shlex.quote(difficult_path)}")
@@ -290,8 +300,8 @@ assert !evaluationSucceeds { gcRootsDir = "/var/lib/../escaped"; };
         assert read_write_metadata == "730 carol users", read_write_metadata
 
     with subtest("daemon receives exact deduplicated allowlist arguments"):
-        machine.wait_for_file("/run/agent-harbor/daemon-args")
-        args = read_nul_args(machine, "/run/agent-harbor/daemon-args")
+        machine.wait_for_file("/run/agentharborfsd/daemon-args")
+        args = read_nul_args(machine, "/run/agentharborfsd/daemon-args")
         assert args == [
             "--socket-path",
             socket_path,
@@ -307,7 +317,7 @@ assert !evaluationSucceeds { gcRootsDir = "/var/lib/../escaped"; };
         assert "--unrestricted" not in args, args
 
     with subtest("service PATH resolves filesystem runtime tools"):
-        tools = machine.succeed("cat /run/agent-harbor/runtime-tools").splitlines()
+        tools = machine.succeed("cat /run/agentharborfsd/runtime-tools").splitlines()
         assert tools == [
             "zfs=${pkgs.zfs}/bin/zfs",
             "btrfs=${pkgs.btrfs-progs}/bin/btrfs",
@@ -315,7 +325,7 @@ assert !evaluationSucceeds { gcRootsDir = "/var/lib/../escaped"; };
             "stat=${pkgs.coreutils}/bin/stat",
         ], tools
 
-    with subtest("shared staging is visible and other shared paths stay read-only"):
+    with subtest("mounts made by the daemon are visible on the host"):
         staging_metadata = machine.succeed(
             "stat -c '%a %U %G' /tmp/ah-zfs-clones"
         ).strip()
@@ -324,11 +334,13 @@ assert !evaluationSucceeds { gcRootsDir = "/var/lib/../escaped"; };
         machine.succeed(
             f"test -e {shlex.quote(difficult_path + '/service-visible')}"
         )
-        machine.fail("test -e /tmp/agent-harbor-unmanaged-write")
-        machine.fail("test -e /etc/agent-harbor-unmanaged-write")
-        machine.fail("test -e /run/agent-harbor/probe-error")
-        machine.succeed("test -s /run/agent-harbor/unmanaged-tmp-error")
-        machine.succeed("test -s /run/agent-harbor/unmanaged-etc-error")
+        for root in ("/tmp/ah-zfs-clones", difficult_path):
+            probe = root + "/mount-probe"
+            source = machine.succeed(
+                f"findmnt -n -o SOURCE --mountpoint {shlex.quote(probe)}"
+            ).strip()
+            assert source == "ah-mount-probe", (probe, source)
+            machine.succeed(f"test -e {shlex.quote(probe + '/inside')}")
 
     deny.start()
 
@@ -336,8 +348,8 @@ assert !evaluationSucceeds { gcRootsDir = "/var/lib/../escaped"; };
         deny.wait_for_unit("ah-fs-snapshots-daemon.socket")
         deny.succeed("systemctl start ah-fs-snapshots-daemon.service")
         deny.wait_for_unit("ah-fs-snapshots-daemon.service")
-        deny.wait_for_file("/run/agent-harbor/daemon-args")
-        args = read_nul_args(deny, "/run/agent-harbor/daemon-args")
+        deny.wait_for_file("/run/agentharborfsd/daemon-args")
+        args = read_nul_args(deny, "/run/agentharborfsd/daemon-args")
         assert args == [
             "--socket-path",
             socket_path,
@@ -354,7 +366,7 @@ assert !evaluationSucceeds { gcRootsDir = "/var/lib/../escaped"; };
         incompatible.wait_for_unit("ah-fs-snapshots-daemon.socket")
         incompatible.fail("systemctl start ah-fs-snapshots-daemon.service")
         incompatible.fail("systemctl is-active --quiet ah-fs-snapshots-daemon.service")
-        incompatible.fail("test -e /run/agent-harbor/incompatible-daemon-started")
+        incompatible.fail("test -e /run/agentharborfsd/incompatible-daemon-started")
         pre_start_status = incompatible.succeed(
             "systemctl show --property=ExecStartPre --value ah-fs-snapshots-daemon.service"
         )
