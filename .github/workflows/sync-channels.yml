@@ -1,0 +1,122 @@
+# Rebase the carried package series (branch `agent-harbor`) onto every upstream
+# channel listed in channels.json, build the carried packages (and run the
+# carried NixOS tests), and publish each channel's `<channel>-agent-harbor`
+# branch only when its builds are green. See README.md. Adapted from
+# metacraft-labs/nixpkgs (branch `metacraft-ci`).
+name: Sync channels
+
+on:
+  schedule:
+    - cron: "23 4 * * *" # daily, 04:23 UTC
+  workflow_dispatch:
+    inputs:
+      channels:
+        description: "Comma-separated upstream channels to sync, e.g. nixos-26.05 (default: every active channel)"
+        required: false
+        default: ""
+      force_build:
+        description: "Build and publish even when the channel would not change"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sync-channels
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    outputs:
+      channels: ${{ steps.plan.outputs.channels }}
+      series_base: ${{ steps.plan.outputs.series_base }}
+      series_len: ${{ steps.plan.outputs.series_len }}
+      series_head: ${{ steps.plan.outputs.series_head }}
+      legacy_overdue: ${{ steps.plan.outputs.legacy_overdue }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: plan
+        run: scripts/sync.sh plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CHANNELS: ${{ inputs.channels }}
+      - name: Ask for a standing branch for a new NixOS release
+        if: steps.plan.outputs.untracked_release != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE: ${{ steps.plan.outputs.untracked_release }}
+        run: |
+          darwin="nixpkgs-${RELEASE#nixos-}-darwin"
+          cat > "$RUNNER_TEMP/body.md" <<BODY
+          Upstream NixOS/nixpkgs has \`$RELEASE\`, which \`channels.json\` does not list.
+
+          Add \`$RELEASE\` and \`$darwin\` to \`channels.json\` on the default branch (the
+          next run creates \`$RELEASE-agent-harbor\` and \`$darwin-agent-harbor\`), and mark a
+          release that upstream no longer supports as \`deprecated\` (README.md,
+          "Adding and retiring channels").
+
+          Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          BODY
+          scripts/issue.sh open "New NixOS release: $RELEASE" "$RUNNER_TEMP/body.md"
+      - name: Ask for the old branch names to be frozen
+        if: steps.plan.outputs.legacy_overdue != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UNTIL: ${{ steps.plan.outputs.legacy_overdue }}
+        run: |
+          cat > "$RUNNER_TEMP/body.md" <<BODY
+          The transition window for the old channel branch names (\`legacyBranch\` in
+          \`channels.json\`, e.g. \`agent-harbor-26.05\`) ended on $UNTIL, and this run
+          still published them (\`legacyBranches.publish\` in \`channels.json\`).
+
+          Freeze them as README.md, "Branch names", describes: turn the flag off, then
+          tag each final tip \`archive/branch/<name>\`.
+
+          Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          BODY
+          scripts/issue.sh open "Freeze the old channel branch names" "$RUNNER_TEMP/body.md"
+
+  sync:
+    needs: plan
+    strategy:
+      fail-fast: false
+      matrix:
+        channel: ${{ fromJSON(needs.plan.outputs.channels) }}
+    permissions:
+      contents: read
+      issues: write
+    uses: ./.github/workflows/sync-channel.yml
+    with:
+      channel: ${{ matrix.channel }}
+      series_base: ${{ needs.plan.outputs.series_base }}
+      series_len: ${{ needs.plan.outputs.series_len }}
+      series_head: ${{ needs.plan.outputs.series_head }}
+      force_build: ${{ inputs.force_build == true }}
+    secrets:
+      CHANNEL_PUSH_KEY: ${{ secrets.CHANNEL_PUSH_KEY }}
+
+  plan-failed:
+    needs: plan
+    if: failure()
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - uses: actions/checkout@v7
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cat > "$RUNNER_TEMP/body.md" <<BODY
+          The channel sync could not determine the carried series on \`agent-harbor\`
+          (for example: it touches files outside the \`seriesPaths\` of \`channels.json\`,
+          or carries nothing).
+          No channel was changed.
+
+          Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          BODY
+          scripts/issue.sh open "Channel sync failed: plan" "$RUNNER_TEMP/body.md"

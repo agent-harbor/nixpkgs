@@ -1,0 +1,30 @@
+{
+  "series": "agent-harbor",
+  "seriesTracks": "nixos-unstable",
+  "seriesPaths": ["pkgs/by-name/", "nixos/modules/", "nixos/tests/"],
+  "nixosTests": ["agent-harbor"],
+  "branchSuffix": "-agent-harbor",
+  "legacyBranches": { "publish": true, "until": "2026-10-28" },
+  "runners": {
+    "x86_64-linux": "ubuntu-latest",
+    "aarch64-darwin": "macos-latest"
+  },
+  "channels": [
+    { "name": "nixos-unstable", "systems": ["x86_64-linux"], "status": "active" },
+    { "name": "nixpkgs-unstable", "systems": ["x86_64-linux", "aarch64-darwin"], "status": "active" },
+    {
+      "name": "nixos-26.05",
+      "systems": ["x86_64-linux", "aarch64-darwin"],
+      "status": "active",
+      "legacyBranch": "agent-harbor-26.05"
+    },
+    { "name": "nixpkgs-26.05-darwin", "systems": ["aarch64-darwin"], "status": "active" },
+    {
+      "name": "nixos-25.05",
+      "systems": ["x86_64-linux"],
+      "status": "active",
+      "legacyBranch": "agent-harbor-25.05",
+      "fixups": ["fixups/nixos-25.05/0001-nixos-25.05-keep-tuwunel-out-of-module-list.nix.patch"]
+    }
+  ]
+}

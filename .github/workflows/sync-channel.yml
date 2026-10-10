@@ -1,0 +1,215 @@
+# One channel: rebase -> build and smoke-test on every system the channel
+# serves, and run the carried NixOS tests on Linux for a nixos-* channel ->
+# publish `<channel>-agent-harbor` (and, during the transition window, the
+# channel's old `legacyBranch` name) -> verify by installing from the
+# published branch.
+# Called once per channel by sync-channels.yml. Publishing needs every build of
+# this channel to be green, so a broken rebase never replaces a working branch;
+# other channels are independent.
+name: Sync one channel
+
+on:
+  workflow_call:
+    inputs:
+      channel:
+        type: string
+        required: true
+      series_base:
+        type: string
+        required: true
+      series_len:
+        type: string
+        required: true
+      series_head:
+        type: string
+        required: true
+      force_build:
+        type: boolean
+        default: false
+    secrets:
+      CHANNEL_PUSH_KEY:
+        required: true
+
+permissions:
+  contents: read
+  issues: write
+
+env:
+  SERIES_BASE: ${{ inputs.series_base }}
+  SERIES_LEN: ${{ inputs.series_len }}
+  SERIES_HEAD: ${{ inputs.series_head }}
+
+jobs:
+  rebase:
+    runs-on: ubuntu-latest
+    outputs:
+      upstream_sha: ${{ steps.rebase.outputs.upstream_sha }}
+      result_sha: ${{ steps.rebase.outputs.result_sha }}
+      old_sha: ${{ steps.rebase.outputs.old_sha }}
+      legacy_old_sha: ${{ steps.rebase.outputs.legacy_old_sha }}
+      changed: ${{ steps.rebase.outputs.changed }}
+      systems: ${{ steps.systems.outputs.systems }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: rebase
+        run: scripts/sync.sh rebase "${{ inputs.channel }}"
+      - id: systems
+        run: |
+          systems=$(jq -c --arg c "${{ inputs.channel }}" \
+            '.runners as $r | .channels[] | select(.name == $c)
+             | [.systems[] | {system: ., runner: $r[.]}]' channels.json)
+          echo "systems=$systems" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: series-${{ inputs.channel }}
+          path: ${{ runner.temp }}/series.bundle
+          retention-days: 7
+      - if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: failure-rebase-${{ inputs.channel }}
+          path: ${{ runner.temp }}/failure.md
+          if-no-files-found: ignore
+
+  build:
+    needs: rebase
+    if: needs.rebase.outputs.changed == 'true' || inputs.force_build
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.rebase.outputs.systems) }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 330
+    env:
+      UPSTREAM_SHA: ${{ needs.rebase.outputs.upstream_sha }}
+      RESULT_SHA: ${{ needs.rebase.outputs.result_sha }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Free disk space
+        if: runner.os == 'Linux'
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+      - name: Let the build use KVM
+        # The NixOS test of the carried module is a VM test. GitHub's Linux
+        # runners have /dev/kvm, but only root may open it.
+        if: runner.os == 'Linux'
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' |
+            sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm || true
+      - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            max-jobs = auto
+            cores = 0
+            ${{ runner.os == 'Linux' && 'system-features = nixos-test benchmark big-parallel kvm' || '' }}
+      - uses: actions/download-artifact@v8
+        with:
+          name: series-${{ inputs.channel }}
+          path: ${{ runner.temp }}
+      - run: scripts/sync.sh checkout
+      - run: scripts/sync.sh build "${{ matrix.system }}" "${{ inputs.channel }}"
+      - if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: failure-build-${{ inputs.channel }}-${{ matrix.system }}
+          path: ${{ runner.temp }}/failure.md
+          if-no-files-found: ignore
+
+  publish:
+    needs: [rebase, build]
+    runs-on: ubuntu-latest
+    env:
+      UPSTREAM_SHA: ${{ needs.rebase.outputs.upstream_sha }}
+      RESULT_SHA: ${{ needs.rebase.outputs.result_sha }}
+      OLD_SHA: ${{ needs.rebase.outputs.old_sha }}
+      LEGACY_OLD_SHA: ${{ needs.rebase.outputs.legacy_old_sha }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: series-${{ inputs.channel }}
+          path: ${{ runner.temp }}
+      - run: scripts/sync.sh checkout
+      - name: Push credentials
+        env:
+          KEY: ${{ secrets.CHANNEL_PUSH_KEY }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$KEY" > ~/.ssh/channel_push_key
+          chmod 600 ~/.ssh/channel_push_key
+          ssh-keyscan -t ed25519 github.com >> ~/.ssh/known_hosts 2>/dev/null
+          echo "GIT_SSH_COMMAND=ssh -i $HOME/.ssh/channel_push_key -o IdentitiesOnly=yes" >> "$GITHUB_ENV"
+      - run: scripts/sync.sh publish "${{ inputs.channel }}"
+      - name: Close a resolved failure issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          scripts/issue.sh close "Channel sync failed: ${{ inputs.channel }}"
+          "Resolved: ${{ inputs.channel }} was published as ${{ env.RESULT_SHA }} by
+          ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+  verify:
+    needs: [rebase, publish]
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.rebase.outputs.systems) }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 330
+    env:
+      UPSTREAM_SHA: ${{ needs.rebase.outputs.upstream_sha }}
+      RESULT_SHA: ${{ needs.rebase.outputs.result_sha }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Free disk space
+        if: runner.os == 'Linux'
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+      - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            max-jobs = auto
+            cores = 0
+      - uses: actions/download-artifact@v8
+        with:
+          name: series-${{ inputs.channel }}
+          path: ${{ runner.temp }}
+      - run: scripts/sync.sh checkout
+      - run: scripts/sync.sh verify "${{ inputs.channel }}" "${{ matrix.system }}"
+      - if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: failure-verify-${{ inputs.channel }}-${{ matrix.system }}
+          path: ${{ runner.temp }}/failure.md
+          if-no-files-found: ignore
+
+  report:
+    needs: [rebase, build, publish, verify]
+    if: failure()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: failure-*-${{ inputs.channel }}*
+          path: ${{ runner.temp }}/failures
+          merge-multiple: false
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          CHANNEL: ${{ inputs.channel }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          {
+            echo "The sync of \`$CHANNEL\` failed. If the rebase or a build failed, the branch"
+            echo "was **not** changed and still holds its last green state."
+            echo
+            echo "Run: $RUN_URL"
+            echo
+            find "$RUNNER_TEMP/failures" -name failure.md -exec cat {} \; 2>/dev/null || true
+          } > "$RUNNER_TEMP/body.md"
+          scripts/issue.sh open "Channel sync failed: $CHANNEL" "$RUNNER_TEMP/body.md"

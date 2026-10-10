@@ -1,0 +1,30 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Zahary Karadjov <zahary@metacraft-labs.com>
+Date: Tue, 13 Oct 2026 12:17:27 +0300
+Subject: [PATCH] nixos-25.05: keep tuwunel out of module-list.nix
+
+Rebasing the series from nixos-unstable onto nixos-25.05 merges its
+module-list.nix hunk without a conflict but carries along the context
+line ./services/matrix/tuwunel.nix, a module 25.05 does not have; every
+NixOS evaluation would then fail on the missing path. Drop that line
+again, so the channel carries exactly the series' own change (one
+`./services/misc/agent-harbor.nix` line).
+
+Applied by the channel sync to nixos-25.05 only, after the rebase
+(channels.json "fixups").
+---
+ nixos/modules/module-list.nix | 1 -
+ 1 file changed, 1 deletion(-)
+
+diff --git a/nixos/modules/module-list.nix b/nixos/modules/module-list.nix
+index c9c3f5ab1..d36764bbd 100644
+--- a/nixos/modules/module-list.nix
++++ b/nixos/modules/module-list.nix
+@@ -777,7 +777,6 @@
+   ./services/matrix/pantalaimon.nix
+   ./services/matrix/synapse-auto-compressor.nix
+   ./services/matrix/synapse.nix
+-  ./services/matrix/tuwunel.nix
+   ./services/misc/agent-harbor.nix
+   ./services/misc/airsonic.nix
+   ./services/misc/amazon-ssm-agent.nix
