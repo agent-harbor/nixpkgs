@@ -21,7 +21,7 @@ let
   # is load-bearing, because the bundle's install names are already correct
   # relative to each other and rewriting them would break the `@loader_path`
   # chain described in `installPhase`.
-  version = "0.6.0";
+  version = "0.6.7";
 
   # `sourceRoot` is per-platform and NOT derivable from `system`: the linux
   # tarball unpacks to `agent-harbor-portable-<system>/`, the macOS one to
@@ -30,7 +30,7 @@ let
   sources = {
     x86_64-linux = {
       url = "https://downloads.agent-harbor.com/linux/v${version}/agent-harbor-portable-${version}-x86_64-linux.tar.gz";
-      hash = "sha256-pJYa2Dw7WiWcDz/y9nXmMFAbFQUnbqFfTnLObkhbVks="; # x86_64
+      hash = "sha256-EtENvDzh+E5mJMe85UytSdcRvxnb3qy8PZplSuC3WN0="; # x86_64
       sourceRoot = "agent-harbor-portable-x86_64-linux";
     };
     aarch64-darwin = {
@@ -40,7 +40,7 @@ let
       # `<prefix>/v<version>/<original filename>`, and `install.sh` already
       # uses `downloads.agent-harbor.com/macos` as the macOS prefix.
       url = "https://downloads.agent-harbor.com/macos/v${version}/ah-macos-arm64.tar.gz";
-      hash = "sha256-XLoamQbQqK6GLLVWXa6jPjpKwKYTNlVtpEKSf6C5kCk="; # aarch64-darwin
+      hash = "sha256-/mI3VB5fwU5OJaig9btmpeTiDmGIgba29mjQ9Wcrquc="; # aarch64-darwin
       sourceRoot = "ah-macos-arm64";
     };
     # aarch64-linux: not yet published; add here when available
