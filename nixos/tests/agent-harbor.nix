@@ -84,8 +84,8 @@ let
   evalCompatibleVersionedPackage = evalVersionlessPackage // {
     version = "0.5.0";
   };
-  # Releases before 0.4.0 have no filesystem allowlists and must be refused,
-  # the default package of this branch (0.3.19) included.
+  # Releases before 0.4.0 have no filesystem allowlists and must be refused.
+  # (This used to be the default package; it is now 0.6.0, asserted below.)
   evalIncompatibleVersionedPackage = evalVersionlessPackage // {
     version = "0.3.19";
   };
@@ -124,7 +124,7 @@ assert !(evalVersionlessPackage ? version);
 assert evaluationSucceeds { };
 assert evaluationSucceeds { package = evalStorePathPackage; };
 assert evaluationSucceeds { package = evalCompatibleVersionedPackage; };
-assert !evaluationSucceeds { package = evalPkgs.agent-harbor; };
+assert evaluationSucceeds { package = evalPkgs.agent-harbor; };
 assert !evaluationSucceeds { package = evalIncompatibleVersionedPackage; };
 assert !evaluationSucceeds { snapshotDaemon.accessGroup = "root"; };
 assert !evaluationSucceeds { snapshotDaemon.allowedZfsDatasets = [ "tank/valid@snapshot" ]; };
