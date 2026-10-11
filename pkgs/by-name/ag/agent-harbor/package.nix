@@ -2,62 +2,153 @@
   lib,
   stdenv,
   fetchurl,
+  makeWrapper,
   nix,
+  slirp4netns,
+  claude-code,
+  # The ACP adapter for Claude Code was renamed upstream; older package sets
+  # carry `claude-code-acp`, newer ones `claude-agent-acp`, some neither.
+  claude-code-acp ? null,
+  claude-agent-acp ? null,
 }:
 
 let
   inherit (stdenv.hostPlatform) system;
 
-  # Pre-built musl-static binaries from the Agent Harbor release pipeline.
-  # No autoPatchelfHook needed — binaries are fully statically linked.
-  version = "0.3.19";
+  # Pre-built binaries from the Agent Harbor release pipeline: musl-static on
+  # linux, and a vendored-dylib bundle on macOS. Neither needs patching, so
+  # there is no autoPatchelfHook and `dontFixup` is set below — on darwin that
+  # is load-bearing, because the bundle's install names are already correct
+  # relative to each other and rewriting them would break the `@loader_path`
+  # chain described in `installPhase`.
+  version = "0.6.7";
 
+  # `sourceRoot` is per-platform and NOT derivable from `system`: the linux
+  # tarball unpacks to `agent-harbor-portable-<system>/`, the macOS one to
+  # `ah-macos-arm64/`. Keeping it next to the url it belongs to is what stops
+  # a new platform from silently unpacking into the wrong directory.
   sources = {
     x86_64-linux = {
       url = "https://downloads.agent-harbor.com/linux/v${version}/agent-harbor-portable-${version}-x86_64-linux.tar.gz";
-      hash = "sha256-BDDptvz5Z1wQZoXp/shp3VzQF8OMILk/gJO4W7CS87M="; # x86_64
+      hash = "sha256-EtENvDzh+E5mJMe85UytSdcRvxnb3qy8PZplSuC3WN0="; # x86_64
+      sourceRoot = "agent-harbor-portable-x86_64-linux";
+    };
+    aarch64-darwin = {
+      # Mirrors the release asset `ah-macos-arm64.tar.gz` under the `macos/`
+      # prefix, matching how the linux tarball is published: the R2 uploader
+      # (`scripts/upload-linux-portable-cloudflare.sh`) writes
+      # `<prefix>/v<version>/<original filename>`, and `install.sh` already
+      # uses `downloads.agent-harbor.com/macos` as the macOS prefix.
+      url = "https://downloads.agent-harbor.com/macos/v${version}/ah-macos-arm64.tar.gz";
+      hash = "sha256-/mI3VB5fwU5OJaig9btmpeTiDmGIgba29mjQ9Wcrquc="; # aarch64-darwin
+      sourceRoot = "ah-macos-arm64";
     };
     # aarch64-linux: not yet published; add here when available
   };
+
+  source = sources.${system} or (throw "agent-harbor: unsupported platform ${system}");
+
+  claudeAcp = if claude-code-acp != null then claude-code-acp else claude-agent-acp;
+
+  # Programs `ah` runs by name that the portable release cannot bundle:
+  #  - slirp4netns: user-mode networking for sandboxed agents. Every
+  #    LLM-backed agent needs network egress, and without it on PATH the
+  #    sandbox refuses to launch the agent at all (Linux only).
+  #  - claude-code-acp: the ACP adapter `ah` drives Claude Code sessions
+  #    through. Missing, every `--agent claude` session fails to spawn.
+  # They live in a private directory APPENDED to PATH, so a user's own,
+  # possibly newer, installs still take precedence.
+  runtimeBinDir = "$out/libexec/agent-harbor/runtime-bin";
 in
 
 stdenv.mkDerivation {
   pname = "agent-harbor";
   inherit version;
 
-  src = fetchurl (sources.${system} or (throw "agent-harbor: unsupported platform ${system}"));
+  src = fetchurl { inherit (source) url hash; };
 
-  # Musl-static binaries — nothing to patch or strip
+  inherit (source) sourceRoot;
+
+  nativeBuildInputs = [ makeWrapper ];
+
+  # Prebuilt release binaries — nothing to patch or strip
   dontStrip = true;
   dontPatchELF = true;
   dontFixup = true;
-
-  sourceRoot = "agent-harbor-portable-${
-    {
-      x86_64-linux = "x86_64-linux";
-      aarch64-linux = "aarch64-linux";
-    }
-    .${system}
-  }";
 
   installPhase = ''
     runHook preInstall
 
     mkdir -p $out/bin $out/libexec/agent-harbor
 
-    if [ -f "bin/ah" ]; then
-      install -m 0755 "bin/ah" "$out/libexec/agent-harbor/ah"
-    fi
+    # The two tarballs do NOT share an internal layout. The linux portable
+    # tarball nests its executables under `bin/`; the macOS bundle puts `ah`
+    # and `ah-fs-snapshots-daemon` at its root, with no `bin/` at all.
+    # Normalise to one variable rather than branching over every copy below.
+    binDir=bin
+    [ -d bin ] || binDir=.
 
-    for bin in ah-fs-snapshots-daemon agentfs-fuse; do
-      if [ -f "bin/$bin" ]; then
-        install -m 0755 "bin/$bin" "$out/bin/$bin"
+    # Fail loudly on an unrecognised layout. Without this the copies below are
+    # simply skipped, the derivation SUCCEEDS with an empty libexec, and the
+    # wrapper written at the end points at a file that does not exist — so the
+    # first symptom is `ah: No such file or directory` on a user's machine
+    # rather than a build error.
+    if [ ! -f "$binDir/ah" ]; then
+      echo "agent-harbor: no 'ah' executable under '$binDir/' in ${source.sourceRoot}." >&2
+      echo "  The release changed its tarball layout; installPhase needs a case for it." >&2
+      echo "  Found instead:" >&2
+      ls -A >&2
+      exit 1
+    fi
+    install -m 0755 "$binDir/ah" "$out/libexec/agent-harbor/ah"
+
+    for bin in ah-fs-snapshots-daemon agentharborfs-fuse agentharborfs-daemon agentfs-fuse; do
+      if [ -f "$binDir/$bin" ]; then
+        install -m 0755 "$binDir/$bin" "$out/bin/$bin"
       fi
     done
+
+    if [ -d "lib" ]; then
+      mkdir -p "$out/lib"
+      cp -a lib/. "$out/lib/"
+      # On macOS `ah` carries LC_RPATH=@loader_path/lib and loads
+      # @rpath/libonnxruntime.<v>.dylib through it, so the libraries must be
+      # reachable as a SIBLING of the real binary. The real binary lives in
+      # libexec (only the wrapper is in bin), so the link has to be there.
+      # Inert on linux, where the binaries are static; required on darwin.
+      ln -s "$out/lib" "$out/libexec/agent-harbor/lib"
+    fi
+
+    if [ -d "share" ]; then
+      mkdir -p "$out/share"
+      cp -a share/. "$out/share/"
+    fi
+
+    mkdir -p "${runtimeBinDir}"
+    ${lib.optionalString stdenv.hostPlatform.isLinux ''
+      ln -s ${lib.getExe slirp4netns} "${runtimeBinDir}/slirp4netns"
+    ''}
+    ${lib.optionalString (claudeAcp != null) ''
+      # An adapter that bundles its own JavaScript Claude Code CLI (cli.js) must
+      # keep it: its SDK parses exactly that CLI's messages, and a newer `claude`
+      # emits types it rejects, failing turns that succeeded (claude-code-acp
+      # 0.10.6 with claude-code 2.1.81, measured 2026-10-08). Only an adapter
+      # without one falls back to a bundled native binary linked against
+      # /lib64/ld-linux-x86-64.so.2, which cannot start on NixOS; point that
+      # kind at nixpkgs' patched `claude`.
+      if find ${claudeAcp}/lib -path '*@anthropic-ai/claude-agent-sdk/cli.js' -print -quit | grep -q .; then
+        makeWrapper ${lib.getExe claudeAcp} "${runtimeBinDir}/claude-code-acp"
+      else
+        makeWrapper ${lib.getExe claudeAcp} "${runtimeBinDir}/claude-code-acp" \
+          --set-default CLAUDE_CODE_EXECUTABLE ${lib.getExe claude-code}
+      fi
+    ''}
 
     cat > "$out/bin/ah" <<EOF
     #!${stdenv.shell}
     set -u
+
+    export PATH="\''${PATH:+\$PATH:}${runtimeBinDir}"
 
     export AH_RUNTIME_ROOT="\''${AH_RUNTIME_ROOT:-$out}"
     export AH_RUNTIME_ROOT_CHANNEL="\''${AH_RUNTIME_ROOT_CHANNEL:-nix}"
