@@ -106,6 +106,23 @@ The frozen branches are not deleted: a user's `flake.lock` may still name them.
   `nixos-25.05`), `agent-harbor-26.05` and `agent-harbor-25.05` are kept under
   `refs/archive/<branch>/<timestamp>`.
 
+### Migration record (2026-10-13)
+
+- Pre-migration tips archived as `refs/archive/<branch>/20261013T095236Z`:
+  `agent-harbor` `18a7e7f1`, `agent-harbor-26.05` `f25c5cde`,
+  `agent-harbor-25.05` `07d075da`; `agent-harbor-25.11` frozen at `009b77a9`
+  (tag `archive/branch/agent-harbor-25.11`). `agent-harbor` was then rewritten
+  to the clean series (`0184deb4`, upstream `nixos-unstable` plus 12 commits).
+- First publication of the channel branches:
+  [run 38384670080](../../actions/runs/38384670080) published
+  `nixos-unstable-agent-harbor` and `nixos-25.05-agent-harbor` (with
+  `agent-harbor-25.05`; one fixup). Its aarch64-darwin builds failed on a
+  bash 3.2 incompatibility in `scripts/sync.sh`, fixed in `773e4baf`;
+  [run 38386090018](../../actions/runs/38386090018) then published
+  `nixpkgs-unstable-agent-harbor`, `nixos-26.05-agent-harbor` (with
+  `agent-harbor-26.05`) and `nixpkgs-26.05-darwin-agent-harbor`, and closed the
+  three failure issues.
+
 ## Packages
 
 | Attribute | Version | Platforms | Upstream status |
