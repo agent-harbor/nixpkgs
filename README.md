@@ -205,7 +205,8 @@ runs **daily at 04:23 UTC** and on demand. For each channel in
    `meta.platforms` excludes a system is skipped there. Then
    [`scripts/smoke.sh`](scripts/smoke.sh) uses it: `ah --version` must report
    the packaged version (on macOS this loads the bundled dylibs), the runtime
-   helpers must be on `ah`'s private PATH, and on Linux
+   helpers must be on `ah`'s private PATH (the Claude Code ACP adapter only
+   where the channel packages one; `nixos-25.05` does not), and on Linux
    `ah-fs-snapshots-daemon --help` must offer the allowlist flags the module
    requires. On a `nixos-*` channel, the Linux build also runs
    `nixosTests.agent-harbor` (a VM test, with the runner's KVM; without KVM it

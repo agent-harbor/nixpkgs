@@ -30,8 +30,19 @@ case "$attr" in
     # The package's own store path (the profile only links to it).
     root=$(dirname "$(dirname "$(readlink -f "$prefix/bin/ah")")")
     runtime="$root/libexec/agent-harbor/runtime-bin"
-    test -x "$runtime/claude-code-acp" ||
-      { echo "::error::$runtime/claude-code-acp is missing: ah cannot start Claude Code sessions"; exit 1; }
+    # package.nix wires in the Claude Code ACP adapter only when the package
+    # set has one (`claude-code-acp`, renamed `claude-agent-acp`); nixos-25.05
+    # has neither, so there it cannot be required. Where the set has one, ah
+    # must find it. If this evaluation fails, require it.
+    has_acp=$(nix eval --impure --raw --expr "
+      let p = import ${WORK} { system = \"$system\"; };
+      in if p ? claude-agent-acp || p ? claude-code-acp then \"yes\" else \"no\"" 2>/dev/null || echo yes)
+    if [[ "$has_acp" == yes ]]; then
+      test -x "$runtime/claude-code-acp" ||
+        { echo "::error::$runtime/claude-code-acp is missing: ah cannot start Claude Code sessions"; exit 1; }
+    else
+      echo "::notice::this package set has no Claude Code ACP adapter; ah is built without one"
+    fi
 
     if [[ "$system" == *-linux ]]; then
       test -x "$runtime/slirp4netns" ||
