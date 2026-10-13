@@ -777,7 +777,6 @@
   ./services/matrix/pantalaimon.nix
   ./services/matrix/synapse-auto-compressor.nix
   ./services/matrix/synapse.nix
-  ./services/matrix/tuwunel.nix
   ./services/misc/agent-harbor.nix
   ./services/misc/airsonic.nix
   ./services/misc/amazon-ssm-agent.nix
