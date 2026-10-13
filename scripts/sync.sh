@@ -39,7 +39,9 @@ WORK="${WORK:-${RUNNER_TEMP:-/tmp}/nixpkgs}"
 BUNDLE="${BUNDLE:-${RUNNER_TEMP:-/tmp}/series.bundle}"
 SERIES_BRANCH=$(jq -r .series "$CONFIG")
 BRANCH_SUFFIX=$(jq -r '.branchSuffix // ""' "$CONFIG")
-mapfile -t SERIES_PATHS < <(jq -r '(.seriesPaths // ["pkgs/by-name/"])[]' "$CONFIG")
+# No `mapfile` here: every subcommand also runs on macOS, whose bash is 3.2.
+SERIES_PATHS=()
+while IFS= read -r _p; do SERIES_PATHS+=("$_p"); done < <(jq -r '(.seriesPaths // ["pkgs/by-name/"])[]' "$CONFIG")
 SCRIPTS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 out() { # key=value to the step outputs (or stdout outside Actions)
@@ -220,7 +222,7 @@ cmd_rebase() {
   local want got fixups=() fix nfix=0
   want=$(change_lines "$SERIES_BASE" "$SERIES_HEAD")
   got=$(change_lines "$upstream_sha" result)
-  mapfile -t fixups < <(jq -r --arg c "$channel" \
+  while IFS= read -r fix; do fixups+=("$fix"); done < <(jq -r --arg c "$channel" \
     '.channels[] | select(.name == $c) | (.fixups // [])[]' "$CONFIG")
   if [[ "$got" != "$want" && ${#fixups[@]} -gt 0 ]]; then
     for fix in "${fixups[@]}"; do
