@@ -51,48 +51,23 @@ release, named with a prefix (`agent-harbor-25.05`, `agent-harbor-25.11`,
 `agent-harbor-26.05`), and none of them was synced. They are replaced by the
 `-agent-harbor` channel branches above.
 
-**Until 2026-10-28, the old names `agent-harbor-26.05` and `agent-harbor-25.05`
-are still published.** Each sync of `nixos-26.05` pushes the same revision to
-`nixos-26.05-agent-harbor` and to `agent-harbor-26.05` in one atomic push, and
-archives it under both; `nixos-25.05` does the same for `agent-harbor-25.05`.
-Configurations that name an old branch keep receiving updates during the
-window. Switch to the `-agent-harbor` name now: the old names stop moving after
-the window.
+**The old names `agent-harbor-26.05` and `agent-harbor-25.05` were frozen on
+2026-10-29.** From 2026-10-13 until 2026-10-28 each sync of `nixos-26.05`
+pushed the same revision to `nixos-26.05-agent-harbor` and to
+`agent-harbor-26.05` in one atomic push, and archived it under both;
+`nixos-25.05` did the same for `agent-harbor-25.05`. On 2026-10-29 the
+`legacyBranches` flag in `channels.json` was turned off (`"publish": false`,
+commit `490977d`), so only the `-agent-harbor` branches move now. Use the
+`-agent-harbor` names.
 
-The cut-over is the `legacyBranches` flag in `channels.json`, together with the
-`legacyBranch` of the `nixos-26.05` and `nixos-25.05` entries:
+The old branches are not deleted, because a user's `flake.lock` may still name
+them. Each one stays at its final tip, which is also tagged
+`archive/branch/<name>`:
 
-```json
-"legacyBranches": { "publish": true, "until": "2026-10-28" }
-```
-
-While `publish` is `true`, the old names are published. Once `until` has
-passed, every run opens the issue `Freeze the old channel branch names` until
-the flag is turned off.
-
-**Freezing the old names (on or after 2026-10-28).** In this order:
-
-1. On `agent-harbor-ci`, set `"publish": false` and push the commit
-   (fast-forward, signed). From the next sync on, only the `-agent-harbor`
-   branches move.
-2. Check that no sync run is in progress:
-   `gh run list -R agent-harbor/nixpkgs -w sync-channels.yml -s in_progress`.
-3. Tag each final tip as `archive/branch/<name>` and check the tag:
-
-   ```sh
-   for b in agent-harbor-26.05 agent-harbor-25.05; do
-     sha=$(gh api "repos/agent-harbor/nixpkgs/branches/$b" --jq .commit.sha)
-     gh api "repos/agent-harbor/nixpkgs/git/refs" \
-       -f ref="refs/tags/archive/branch/$b" -f sha="$sha" --jq .object.sha
-     [ "$(git ls-remote https://github.com/agent-harbor/nixpkgs "refs/tags/archive/branch/$b" | cut -f1)" = "$sha" ] &&
-       echo "$b frozen at $sha"
-   done
-   ```
-
-4. Mark the old names as frozen in this README, and in the policy's
-   current-state note.
-
-The frozen branches are not deleted: a user's `flake.lock` may still name them.
+| Old name | Frozen at | Same revision as |
+|---|---|---|
+| `agent-harbor-26.05` | `18c2fa4c6d384ddd9c42e480d41c2dd4bc73e692` | `nixos-26.05-agent-harbor` on 2026-10-29 |
+| `agent-harbor-25.05` | `0e8079b46773443f93a20a6c2552c4bffe21cecc` | `nixos-25.05-agent-harbor` on 2026-10-29 |
 
 ### Frozen branches
 
@@ -229,8 +204,8 @@ runs **daily at 04:23 UTC** and on demand. For each channel in
    `nixosTests.agent-harbor` (a VM test, with the runner's KVM; without KVM it
    is only evaluated, with a warning).
 3. **publish** only if every build of that channel is green: force-push
-   `<channel>-agent-harbor` (and, during the transition window,
-   `agent-harbor-26.05` for `nixos-26.05`) in one atomic push, with a lease on
+   `<channel>-agent-harbor` (and, while `legacyBranches.publish` is `true`, the
+   channel's `legacyBranch`) in one atomic push, with a lease on
    the tip each had when the run started. **A broken rebase or build never
    replaces a working branch.** Each published revision is also kept under
    `refs/archive/<branch>/<timestamp>` for every name it is published under, so
@@ -240,8 +215,8 @@ runs **daily at 04:23 UTC** and on demand. For each channel in
 4. **verify** the published branch the way a user installs from it:
    `nix build github:agent-harbor/nixpkgs/<channel>-agent-harbor#agent-harbor`,
    then `nix profile install` into a throwaway profile and the same smoke test.
-   During the transition window it also checks that `agent-harbor-26.05`
-   resolves to the same revision. A failure here cannot un-publish, so it opens
+   While `legacyBranches.publish` is `true` it also checks that the channel's
+   `legacyBranch` resolves to the same revision. A failure here cannot un-publish, so it opens
    the channel's issue.
 
 After `nixos-unstable-agent-harbor` publishes, `agent-harbor` itself is moved
@@ -368,7 +343,7 @@ table above as deprecated.
 - `agent-harbor`: where our commits are authored (see above).
 - `agent-harbor-26.05`, `agent-harbor-25.05`: the old names of
   `nixos-26.05-agent-harbor` and `nixos-25.05-agent-harbor`, published alongside
-  them until 2026-10-28 and then frozen (see "Branch names").
+  them until 2026-10-28 and frozen on 2026-10-29 (see "Branch names").
 - `agent-harbor-25.11`: frozen (see "Frozen branches").
 - `master`: the former default branch, an old upstream `master` plus one commit
   that moved upstream's CI from Cachix to Attic. It carries nothing of the
