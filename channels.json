@@ -4,7 +4,7 @@
   "seriesPaths": ["pkgs/by-name/", "nixos/modules/", "nixos/tests/"],
   "nixosTests": ["agent-harbor"],
   "branchSuffix": "-agent-harbor",
-  "legacyBranches": { "publish": true, "until": "2026-10-28" },
+  "legacyBranches": { "publish": false, "until": "2026-10-28" },
   "runners": {
     "x86_64-linux": "ubuntu-latest",
     "aarch64-darwin": "macos-latest"
