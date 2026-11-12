@@ -80,6 +80,26 @@ let
     "--allowed-btrfs-path"
     path
   ]) effectiveAllowedBtrfsPaths;
+
+  # Starts the daemon with `--idle-exit-after` when the packaged binary
+  # supports it, and without it otherwise, so this module keeps working with
+  # packages that predate the flag (agent-harbor 34005e7cf64 added it). It
+  # `exec`s, so the daemon keeps the PID systemd handed the socket to and
+  # expects readiness from.
+  daemonStart = pkgs.writeShellScript "ah-fs-snapshots-daemon-start" ''
+    set -eu
+    daemon="$1"
+    shift
+    idle_exit_after=${lib.escapeShellArg (toString cfg.snapshotDaemon.idleExitAfter)}
+    if [ -n "$idle_exit_after" ]; then
+      if "$daemon" --help 2>/dev/null | ${pkgs.gnugrep}/bin/grep -Fq -- '--idle-exit-after'; then
+        exec "$daemon" "$@" --idle-exit-after "$idle_exit_after"
+      fi
+      echo "ah-fs-snapshots-daemon-start: $daemon does not support --idle-exit-after;" \
+        "upgrades will not replace it until it is restarted" >&2
+    fi
+    exec "$daemon" "$@"
+  '';
 in
 {
   meta.maintainers = [ ];
@@ -162,6 +182,25 @@ in
           as root with mode 0755, while existing ownership and modes are
           preserved. The empty default emits an explicit deny-all value; it never
           starts the daemon without a Btrfs allowlist.
+        '';
+      };
+
+      idleExitAfter = lib.mkOption {
+        type = lib.types.nullOr (lib.types.strMatching "[1-9][0-9]*(s|m|min|h)?");
+        default = "10min";
+        example = "30min";
+        description = ''
+          Let the socket-activated daemon exit after this long with no live
+          work (no client connection, child process, AgentHarborFS mount host
+          or unconsumed elevation token), so that the next connection starts
+          the binary the unit currently names.
+
+          This is how a package switch replaces the daemon: the service has
+          `restartIfChanged = false`, because a restart would kill the work
+          the daemon holds, so without it an upgraded host keeps the old
+          daemon until it is restarted. `null` disables it. Ignored, with a
+          message in the journal, for packages whose daemon predates the
+          flag.
         '';
       };
 
@@ -284,6 +323,10 @@ in
     # over a Unix socket passed by systemd.
     systemd.services.ah-fs-snapshots-daemon = {
       description = "Agent Harbor Filesystem Snapshots Daemon";
+      # A package switch must not stop the daemon: it holds mount hosts,
+      # child processes and elevation tokens in memory. It is replaced
+      # instead by exiting when idle (snapshotDaemon.idleExitAfter), after
+      # which the socket starts the new ExecStart.
       restartIfChanged = false;
       after = [
         "network.target"
@@ -307,7 +350,7 @@ in
         Type = "notify";
         User = "root";
         Group = "root";
-        ExecStart = utils.escapeSystemdExecArgs daemonArgs;
+        ExecStart = utils.escapeSystemdExecArgs ([ daemonStart ] ++ daemonArgs);
         Restart = "on-failure";
         RestartSec = 5;
         TimeoutStopSec = 30;
