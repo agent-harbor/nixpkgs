@@ -60,6 +60,35 @@ let
     exit 1
   '';
 
+  # Stand-ins for a daemon that supports `--idle-exit-after`, one per package
+  # generation. They test the module and systemd side of idle exit: the flag
+  # reaches a daemon that advertises it, a package switch leaves the running
+  # daemon alone, and after a clean exit the socket starts the switched-to
+  # binary. When to exit is the daemon's own logic (tested in agent-harbor);
+  # here the test decides, by creating the release file.
+  mkIdleExitDaemon =
+    generation:
+    pkgs.writeShellScriptBin "ah-fs-snapshots-daemon" ''
+      set -eu
+
+      if [ "''${1:-}" = "--help" ]; then
+        printf '%s\n' \
+          'Usage: ah-fs-snapshots-daemon [OPTIONS]' \
+          '  --allowed-zfs-dataset <DATASET>' \
+          '  --allowed-btrfs-path <PATH>' \
+          '  --idle-exit-after <IDLE_EXIT_AFTER>'
+        exit 0
+      fi
+
+      printf '%s\0' "$@" > /run/agentharborfsd/daemon-args-${generation}
+      echo ${generation} >> /run/agentharborfsd/generations-started
+      ${pkgs.systemd}/bin/systemd-notify --pid=parent --ready
+      while [ ! -e /run/agentharborfsd/release-${generation} ]; do
+        ${pkgs.coreutils}/bin/sleep 0.2
+      done
+      exit 0
+    '';
+
   mkVersionlessTestPackage =
     name: snapshotDaemon:
     pkgs.runCommand name { } ''
@@ -70,6 +99,8 @@ let
 
   testPackage = mkVersionlessTestPackage "agent-harbor-test-package" fakeSnapshotDaemon;
   incompatibleTestPackage = mkVersionlessTestPackage "agent-harbor-incompatible-test-package" fakeIncompatibleSnapshotDaemon;
+  idleFirstPackage = mkVersionlessTestPackage "agent-harbor-idle-first" (mkIdleExitDaemon "first");
+  idleSecondPackage = mkVersionlessTestPackage "agent-harbor-idle-second" (mkIdleExitDaemon "second");
 
   # Keep negative module evaluations independent of the test driver's `pkgs`
   # fixpoint; feeding that package set back through eval-config recurses.
@@ -138,6 +169,10 @@ assert !evaluationSucceeds { snapshotDaemon.allowedBtrfsPaths = [ "/" ]; };
 assert !evaluationSucceeds { snapshotDaemon.readWritePaths = [ "/" ]; };
 assert !evaluationSucceeds { activationStore = "relative/path"; };
 assert !evaluationSucceeds { gcRootsDir = "/var/lib/../escaped"; };
+assert evaluationSucceeds { snapshotDaemon.idleExitAfter = null; };
+assert evaluationSucceeds { snapshotDaemon.idleExitAfter = "30s"; };
+assert !evaluationSucceeds { snapshotDaemon.idleExitAfter = "0"; };
+assert !evaluationSucceeds { snapshotDaemon.idleExitAfter = "10 minutes"; };
 {
   name = "agent-harbor";
 
@@ -197,6 +232,25 @@ assert !evaluationSucceeds { gcRootsDir = "/var/lib/../escaped"; };
           readWritePaths = [ difficultBtrfsPath ];
         };
       };
+    };
+
+    idle = {
+      services.agent-harbor = {
+        enable = true;
+        package = idleFirstPackage;
+        snapshotDaemon = {
+          accessGroup = "ah-idle-access";
+          idleExitAfter = "45s";
+        };
+      };
+      # The package a later switch installs.
+      specialisation.next.configuration.services.agent-harbor.package = lib.mkForce idleSecondPackage;
+      # The installed-version activation realises the package with
+      # snapshotDaemon's nix-store to root it, and in a test VM that store
+      # database does not list the package ("path ... is not valid", measured
+      # 2026-11-12), so switch-to-configuration would fail before reaching
+      # the service. These subtests are about the service, not activation.
+      system.activationScripts.agentHarborActivateInstalledVersion = lib.mkForce "";
     };
 
     incompatible = {
@@ -359,6 +413,62 @@ assert !evaluationSucceeds { gcRootsDir = "/var/lib/../escaped"; };
             "/dev/null",
         ], args
         assert "--unrestricted" not in args, args
+
+    with subtest("a daemon without --idle-exit-after starts without it, and says so"):
+        journal = machine.succeed("journalctl -b -u ah-fs-snapshots-daemon.service")
+        assert "does not support --idle-exit-after" in journal, journal
+
+    idle.start()
+
+    def idle_daemon_pid():
+        return idle.succeed(
+            "systemctl show --property=MainPID --value ah-fs-snapshots-daemon.service"
+        ).strip()
+
+    with subtest("an idle-exit capable daemon receives the configured period"):
+        idle.wait_for_unit("ah-fs-snapshots-daemon.socket")
+        idle.succeed("systemctl start ah-fs-snapshots-daemon.service")
+        idle.wait_for_unit("ah-fs-snapshots-daemon.service")
+        args = read_nul_args(idle, "/run/agentharborfsd/daemon-args-first")
+        assert args[-2:] == ["--idle-exit-after", "45s"], args
+        assert args[:2] == ["--socket-path", socket_path], args
+
+    with subtest("a package switch leaves the running daemon alone"):
+        first_pid = idle_daemon_pid()
+        idle.succeed(
+            "/run/current-system/specialisation/next/bin/switch-to-configuration test"
+        )
+        assert idle_daemon_pid() == first_pid, "the switch restarted the daemon"
+        unit = idle.succeed("systemctl cat ah-fs-snapshots-daemon.service")
+        assert "agent-harbor-idle-second" in unit, unit
+        idle.fail("test -e /run/agentharborfsd/daemon-args-second")
+
+    with subtest("after an idle exit the next connection starts the switched-to binary"):
+        idle.succeed("touch /run/agentharborfsd/release-first")
+        idle.wait_until_succeeds(
+            "systemctl show --property=SubState --value ah-fs-snapshots-daemon.service"
+            " | grep -qx dead"
+        )
+        result = idle.succeed(
+            "systemctl show --property=Result --value ah-fs-snapshots-daemon.service"
+        ).strip()
+        assert result == "success", result
+        # A clean exit is not restarted by Restart=on-failure; only a client
+        # starts the daemon again, through the socket that stayed listening.
+        idle.succeed("sleep 7")
+        idle.fail("systemctl is-active --quiet ah-fs-snapshots-daemon.service")
+        idle.succeed("systemctl is-active --quiet ah-fs-snapshots-daemon.socket")
+        idle.succeed(
+            "${pkgs.python3}/bin/python3 -c "
+            + shlex.quote(
+                "import socket; "
+                f"sock = socket.socket(socket.AF_UNIX); sock.connect({socket_path!r}); sock.close()"
+            )
+        )
+        idle.wait_for_file("/run/agentharborfsd/daemon-args-second")
+        idle.wait_for_unit("ah-fs-snapshots-daemon.service")
+        generations = idle.succeed("cat /run/agentharborfsd/generations-started").split()
+        assert generations == ["first", "second"], generations
 
     incompatible.start()
 
