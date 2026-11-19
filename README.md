@@ -102,7 +102,7 @@ them. Each one stays at its final tip, which is also tagged
 
 | Attribute | Version | Platforms | Upstream status |
 |---|---|---|---|
-| `agent-harbor` (`ah`) | 0.6.7 | x86_64-linux, aarch64-darwin | not submitted: prebuilt unfree binary |
+| `agent-harbor` (`ah`) | 0.6.17 | x86_64-linux, aarch64-darwin | not submitted: prebuilt unfree binary |
 
 The series also carries the NixOS module `services.agent-harbor`
 (`nixos/modules/services/misc/agent-harbor.nix`: the `ah-fs-snapshots-daemon`
@@ -180,6 +180,38 @@ Why a rebased series and not merges or a patch directory:
   how the delta drifted apart before (the 25.05, 25.11 and 26.05 branches each
   carried a different subset until they were synced by hand); generating every
   channel from one series cannot.
+
+### The series stays linear
+
+`agent-harbor` must stay a **linear** series on its upstream base: no merge
+commits. The sync takes the series to be the last `<n>` commits of
+`agent-harbor`, where `<n>` is how far `agent-harbor` is ahead of upstream
+`master`, and it checks that `agent-harbor~<n>` is the merge base. A merge
+commit breaks that check, and then no channel is synced (`did agent-harbor
+move?`) until the series is linear again.
+
+Therefore:
+
+- A change, including a release bump, lands on `agent-harbor` as linear
+  commits: pushed directly as a fast-forward, or through a pull request landed
+  with a **rebase merge**. A rebase merge is an exception to the branching
+  policy's merge-commit rule, for this branch only (approved 2026-11-19 by
+  Zahary Karadjov). Never land a pull request into `agent-harbor` as a merge
+  commit or a squash of several changes.
+- A release bump is a **single** commit, `agent-harbor: <old> -> <new>`.
+- After a bump, dispatch `sync-channels.yml` and wait for the five channel
+  branches to publish the new version. A release is not done until they serve
+  it.
+
+**Repair of 2026-11-19.** The 0.6.17 bump landed on 2026-11-13 through two
+pull requests merged as merge commits (#7, then #8, an empty duplicate of
+#7's change), and every sync from 2026-11-14 to 2026-11-19 failed in `rebase`
+(issues #9 to #13), so the channels stayed at 0.6.16. With a one-time
+force-update approved by Zahary Karadjov on 2026-11-19, `agent-harbor` was
+moved from `c887bd057a7894f22df37aae3f2cc7e473f56161` back to
+`76e9831aa4a2a26559a74b9e55a6a8c49e0fc29d` (`agent-harbor: 0.6.16 -> 0.6.17`,
+#7's commit). Both revisions have the same tree, so the series' content did
+not change; only the two merge commits and the empty commit were dropped.
 
 ### The automation
 
@@ -269,9 +301,12 @@ cd nixpkgs
 pkgs/by-name/ag/agent-harbor/update.sh          # or: LATEST_VER=0.6.8 pkgs/by-name/ag/agent-harbor/update.sh
 NIXPKGS_ALLOW_UNFREE=1 nix build --impure .#agent-harbor && ./result/bin/ah --version
 git commit -am 'agent-harbor: 0.6.7 -> 0.6.8'
-git push origin agent-harbor
+git push origin agent-harbor                     # a fast-forward: never a merge commit
 gh workflow run sync-channels.yml -R agent-harbor/nixpkgs   # don't wait for the daily run
 ```
+
+Then wait for every channel branch to publish the version ("The series stays
+linear").
 
 **Changing the module** is the same flow: commit to `agent-harbor`, with the
 NixOS test updated alongside (`nix build --impure .#nixosTests.agent-harbor`;
