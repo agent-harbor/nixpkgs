@@ -59,6 +59,31 @@ let
   # They live in a private directory APPENDED to PATH, so a user's own,
   # possibly newer, installs still take precedence.
   runtimeBinDir = "$out/libexec/agent-harbor/runtime-bin";
+
+  # Release executables `ah` looks for beside its own executable, which is
+  # `$out/libexec/agent-harbor/ah` (the `bin/ah` wrapper below execs it), so
+  # they are installed there and linked into `bin/`, as the native packages
+  # put them in /usr/bin beside `ah`:
+  #  - oq: the Org query/schema CLI; `ah` names it in AH_OQ_BIN for the
+  #    processes it starts.
+  #  - ah-mcp-connector: the built-in SaaS connector server, which `ah`
+  #    starts only from beside itself.
+  #  - llm-api-proxy: the capture proxy `ah agent start` runs every agent
+  #    behind (Linux only: the macOS tarball does not carry it yet).
+  # A release without one fails the build instead of shipping an `ah` that
+  # cannot start them.
+  besideAh = [
+    "oq"
+    "ah-mcp-connector"
+  ]
+  ++ lib.optional stdenv.hostPlatform.isLinux "llm-api-proxy";
+
+  # The polkit action through which the daemon confirms that the person, not
+  # an agent, decides an approval request. polkit reads actions from
+  # share/polkit-1/actions of the packages in environment.systemPackages,
+  # where the NixOS module services.agent-harbor puts this package. The
+  # portable tarball carries it; the macOS one has no use for it.
+  polkitAction = "share/polkit-1/actions/org.agentharbor.approval.policy";
 in
 
 stdenv.mkDerivation {
@@ -102,6 +127,15 @@ stdenv.mkDerivation {
     fi
     install -m 0755 "$binDir/ah" "$out/libexec/agent-harbor/ah"
 
+    for bin in ${lib.escapeShellArgs besideAh}; do
+      if [ ! -f "$binDir/$bin" ]; then
+        echo "agent-harbor: no '$bin' beside 'ah' under '$binDir/' in ${source.sourceRoot}." >&2
+        exit 1
+      fi
+      install -m 0755 "$binDir/$bin" "$out/libexec/agent-harbor/$bin"
+      ln -s "$out/libexec/agent-harbor/$bin" "$out/bin/$bin"
+    done
+
     for bin in ah-fs-snapshots-daemon agentharborfs-fuse agentharborfs-daemon agentfs-fuse; do
       if [ -f "$binDir/$bin" ]; then
         install -m 0755 "$binDir/$bin" "$out/bin/$bin"
@@ -123,6 +157,12 @@ stdenv.mkDerivation {
       mkdir -p "$out/share"
       cp -a share/. "$out/share/"
     fi
+    ${lib.optionalString stdenv.hostPlatform.isLinux ''
+      if [ ! -f "$out/${polkitAction}" ]; then
+        echo "agent-harbor: no ${polkitAction} in ${source.sourceRoot}." >&2
+        exit 1
+      fi
+    ''}
 
     mkdir -p "${runtimeBinDir}"
     ${lib.optionalString stdenv.hostPlatform.isLinux ''

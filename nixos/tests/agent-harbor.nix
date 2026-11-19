@@ -130,6 +130,76 @@ let
     };
   };
 
+  # The release package itself, built from a tarball with the published
+  # x86_64-linux portable layout, so the test checks what the package
+  # installs from a release without downloading one: the executables `ah`
+  # looks for beside itself, and the approval polkit action. Each placeholder
+  # executable prints its own name.
+  approvalActionId = "org.agentharbor.approval.confirm-person";
+  # The action's policy as agent-harbor ships it
+  # (packaging/linux/polkit/org.agentharbor.approval.policy): the action id
+  # and auth_self (the user's own password, every time).
+  fixturePolicy = pkgs.writeText "org.agentharbor.approval.policy" ''
+    <?xml version="1.0" encoding="UTF-8"?>
+    <!DOCTYPE policyconfig PUBLIC
+     "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+     "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+    <policyconfig>
+      <vendor>Agent Harbor</vendor>
+      <action id="${approvalActionId}">
+        <description>Confirm it is you deciding an Agent Harbor approval request</description>
+        <message>Agent Harbor needs your password to confirm that you, not an agent, are deciding an approval request or opening its page.</message>
+        <defaults>
+          <allow_any>auth_self</allow_any>
+          <allow_inactive>auth_self</allow_inactive>
+          <allow_active>auth_self</allow_active>
+        </defaults>
+      </action>
+    </policyconfig>
+  '';
+  besideAh = [
+    "oq"
+    "ah-mcp-connector"
+    "llm-api-proxy"
+  ];
+  fixtureRelease = pkgs.runCommand "agent-harbor-portable-fixture-x86_64-linux.tar.gz" { } ''
+    root=agent-harbor-portable-x86_64-linux
+    mkdir -p "$root/bin" "$root/share/polkit-1/actions"
+    for bin in ah ah-fs-snapshots-daemon ${lib.escapeShellArgs besideAh}; do
+      printf '#!${pkgs.runtimeShell}\necho %s\n' "$bin" > "$root/bin/$bin"
+      chmod 0755 "$root/bin/$bin"
+    done
+    cp ${fixturePolicy} "$root/share/polkit-1/actions/org.agentharbor.approval.policy"
+    tar -czf "$out" "$root"
+  '';
+  # From evalPkgs, which allows the unfree package; without the ACP adapter,
+  # which this test does not use.
+  releasePackage =
+    (evalPkgs.agent-harbor.override {
+      claude-code-acp = null;
+      claude-agent-acp = null;
+    }).overrideAttrs
+      {
+        src = fixtureRelease;
+        sourceRoot = "agent-harbor-portable-x86_64-linux";
+      };
+  # The same release without one of them: the package must refuse to build
+  # rather than ship an `ah` that cannot start it. Each value is the build
+  # failure's log (testers.testBuildFailure), read by the test driver.
+  releaseWithout =
+    path:
+    evalPkgs.testers.testBuildFailure (
+      releasePackage.overrideAttrs (old: {
+        postUnpack = (old.postUnpack or "") + "rm agent-harbor-portable-x86_64-linux/${path}\n";
+      })
+    );
+  refusals = lib.listToAttrs (
+    map (bin: lib.nameValuePair bin "${releaseWithout "bin/${bin}"}/testBuildFailure.log") besideAh
+    ++ [
+      (lib.nameValuePair "polkit" "${releaseWithout "share/polkit-1/actions/org.agentharbor.approval.policy"}/testBuildFailure.log")
+    ]
+  );
+
   evalConfiguration =
     overrides:
     import ../lib/eval-config.nix {
@@ -250,6 +320,22 @@ assert !evaluationSucceeds { snapshotDaemon.idleExitAfter = "10 minutes"; };
       # database does not list the package ("path ... is not valid", measured
       # 2026-11-12), so switch-to-configuration would fail before reaching
       # the service. These subtests are about the service, not activation.
+      system.activationScripts.agentHarborActivateInstalledVersion = lib.mkForce "";
+    };
+
+    packaged = {
+      services.agent-harbor = {
+        enable = true;
+        package = releasePackage;
+        snapshotDaemon.accessGroup = "ah-packaged-access";
+      };
+      # polkit reads the actions of the packages in environment.systemPackages
+      # (share/polkit-1 is linked into /run/current-system/sw when it is
+      # enabled); the approval action needs it running.
+      security.polkit.enable = true;
+      # As on the idle node: the test VM's store database does not list the
+      # package, so the installed-version activation fails at boot. These
+      # subtests are about what the package installs, not activation.
       system.activationScripts.agentHarborActivateInstalledVersion = lib.mkForce "";
     };
 
@@ -469,6 +555,49 @@ assert !evaluationSucceeds { snapshotDaemon.idleExitAfter = "10 minutes"; };
         idle.wait_for_unit("ah-fs-snapshots-daemon.service")
         generations = idle.succeed("cat /run/agentharborfsd/generations-started").split()
         assert generations == ["first", "second"], generations
+
+    with subtest("the package refuses a release without them"):
+        refusals = json.loads(${builtins.toJSON (builtins.toJSON refusals)})
+        # (Not named `log`: the driver's logger is a global of that name.)
+        for name in ${builtins.toJSON besideAh}:
+            build_log = open(refusals[name]).read()
+            assert f"no '{name}' beside 'ah'" in build_log, (name, build_log)
+        build_log = open(refusals["polkit"]).read()
+        assert "no share/polkit-1/actions/org.agentharbor.approval.policy" in build_log, build_log
+
+    packaged.start()
+    packaged.wait_for_unit("multi-user.target")
+
+    with subtest("oq, ah-mcp-connector and llm-api-proxy are on PATH beside the package's ah"):
+        libexec = "${releasePackage}/libexec/agent-harbor"
+        packaged.succeed(f"test -x {libexec}/ah")
+        ah = packaged.succeed("command -v ah").strip()
+        assert ah == "/run/current-system/sw/bin/ah", ah
+        for name in ${builtins.toJSON besideAh}:
+            on_path = packaged.succeed(f"command -v {name}").strip()
+            assert on_path == f"/run/current-system/sw/bin/{name}", (name, on_path)
+            resolved = packaged.succeed(f"readlink -f {on_path}").strip()
+            assert resolved == f"{libexec}/{name}", (name, resolved)
+            output = packaged.succeed(f"{name}").strip()
+            assert output == name, (name, output)
+
+    with subtest("the approval polkit action is installed and polkit knows it"):
+        packaged.succeed(
+            "test -f /run/current-system/sw/share/polkit-1/actions/org.agentharbor.approval.policy"
+        )
+        action = packaged.succeed(
+            "pkaction --verbose --action-id ${approvalActionId}"
+        )
+        lines = action.splitlines()
+        assert lines[0] == "${approvalActionId}:", action
+        fields = dict(
+            (key.strip(), value.strip())
+            for key, _, value in (line.partition(":") for line in lines[1:] if line.strip())
+        )
+        assert fields.get("vendor") == "Agent Harbor", action
+        # auth_self, every time: the person's own password, never cached.
+        for implicit in ("implicit any", "implicit inactive", "implicit active"):
+            assert fields.get(implicit) == "auth_self", (implicit, action)
 
     incompatible.start()
 
